@@ -1,0 +1,65 @@
+name: Build & Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Restore signing keystore (from repo secrets)
+        env:
+          KEYSTORE_B64: ${{ secrets.KEYSTORE_B64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        if: env.KEYSTORE_B64 != ''
+        run: |
+          mkdir -p keystore
+          echo "$KEYSTORE_B64" | base64 -d > keystore/galigalimusic-release.jks
+          printf 'storeFile=keystore/galigalimusic-release.jks\nstorePassword=%s\nkeyAlias=%s\nkeyPassword=%s\n' \
+            "$KEYSTORE_PASSWORD" "$KEY_ALIAS" "$KEY_PASSWORD" > keystore.properties
+
+      - name: Build signed release
+        if: ${{ env.KEYSTORE_B64 != '' }}
+        run: ./gradlew :app:assembleProdRelease --no-daemon
+
+      - name: Build debug-signed APK (no keystore in CI)
+        if: ${{ env.KEYSTORE_B64 == '' }}
+        run: ./gradlew :app:assembleProdDebug --no-daemon
+
+      - name: Collect APK
+        id: apk
+        run: |
+          if [ -f app/build/outputs/apk/prod/release/app-prod-release.apk ]; then
+            cp app/build/outputs/apk/prod/release/app-prod-release.apk galigalimusic.apk
+          else
+            cp app/build/outputs/apk/prod/debug/app-prod-debug.apk galigalimusic.apk
+          fi
+          echo "file=galigalimusic.apk" >> "$GITHUB_OUTPUT"
+
+      - name: Attach to GitHub Release (tag pushes)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: galigalimusic.apk
+          fail_on_unmatched_files: true
+
+      - name: Upload build artifact (manual runs)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: galigalimusic-apk
+          path: galigalimusic.apk
