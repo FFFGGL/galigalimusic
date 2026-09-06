@@ -1,0 +1,20 @@
+# Build outputs
+app/build/
+build/
+app/.cxx/
+release/
+
+# Gradle / IDE
+.gradle/
+.kotlin/
+.idea/
+local.properties
+*.iml
+
+# Signing keys - 绝不能上传！
+keystore/
+keystore.properties
+
+# OS junk
+.DS_Store
+Thumbs.db
