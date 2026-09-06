@@ -19,6 +19,11 @@ jobs:
           distribution: temurin
           java-version: '17'
 
+      - name: Set up Android SDK + NDK + CMake
+        uses: android-actions/setup-android@v3
+      - name: Install NDK & CMake
+        run: sdkmanager --install "ndk;27.1.12297006" "cmake;3.22.1" > /dev/null
+
       - name: Restore signing keystore (from repo secrets)
         env:
           KEYSTORE_B64: ${{ secrets.KEYSTORE_B64 }}
