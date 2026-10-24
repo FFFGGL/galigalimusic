@@ -10,6 +10,11 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    # KEYSTORE_B64 必须放在 job 级：step 级 env 不跨步骤共享，
+    # 否则「恢复 keystore」能成功，但后面两个构建步骤读到的都是空值，
+    # 结果签名构建被跳过、反而走了 debug 降级分支。
+    env:
+      KEYSTORE_B64: ${{ secrets.KEYSTORE_B64 }}
     steps:
       - uses: actions/checkout@v4
 
@@ -25,12 +30,11 @@ jobs:
         run: sdkmanager --install "ndk;27.1.12297006" "cmake;3.22.1" > /dev/null
 
       - name: Restore signing keystore (from repo secrets)
+        if: env.KEYSTORE_B64 != ''
         env:
-          KEYSTORE_B64: ${{ secrets.KEYSTORE_B64 }}
           KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
           KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
-        if: env.KEYSTORE_B64 != ''
         run: |
           mkdir -p keystore
           echo "$KEYSTORE_B64" | base64 -d > keystore/galigalimusic-release.jks
@@ -50,10 +54,25 @@ jobs:
         run: |
           if [ -f app/build/outputs/apk/prod/release/app-prod-release.apk ]; then
             cp app/build/outputs/apk/prod/release/app-prod-release.apk galigalimusic.apk
-          else
+            echo "signed=true" >> "$GITHUB_OUTPUT"
+            echo "使用正式签名包"
+          elif [ -f app/build/outputs/apk/prod/debug/app-prod-debug.apk ]; then
             cp app/build/outputs/apk/prod/debug/app-prod-debug.apk galigalimusic.apk
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::未找到正式签名包，回退到 debug 签名包"
+          else
+            echo "::error::没有找到任何 APK 产物"
+            exit 1
           fi
           echo "file=galigalimusic.apk" >> "$GITHUB_OUTPUT"
+          ls -la galigalimusic.apk
+
+      - name: Verify APK signature
+        if: steps.apk.outputs.signed == 'true'
+        run: |
+          APKSIGNER=$(ls "$ANDROID_HOME"/build-tools/*/apksigner | head -1)
+          "$APKSIGNER" verify --print-certs galigalimusic.apk
+          echo "签名验证通过"
 
       - name: Attach to GitHub Release (tag pushes)
         if: startsWith(github.ref, 'refs/tags/')
