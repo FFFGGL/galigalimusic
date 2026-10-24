@@ -45,14 +45,28 @@ object BiliSession {
         _mid.value = prefs!!.getString(KEY_MID, "").orEmpty()
     }
 
+    /** 诊断日志写入计数：用于每 200 次检查一次体积 */
+    @Volatile
+    private var debugWrites = 0
+
+    private const val MAX_DEBUG_BYTES = 512 * 1024L
+
     /**
      * 诊断日志追加到外部私有目录（华为 EMUI 压制第三方 logcat，文件是可靠通道）。
      * adb 读取：/sdcard/Android/data/<pkg>/files/lyric_debug.log
+     *
+     * 加上限：识别 40 分钟音频每段都会写，长期使用不截断会无限增长。
      */
     fun appendDebug(line: String) {
         val ctx = appContext ?: return
         runCatching {
             val f = java.io.File(ctx.getExternalFilesDir(null), "lyric_debug.log")
+            // 每 200 次检查一次体积，超过 512KB 就轮转（只保留上一份 .1）
+            if (++debugWrites % 200 == 0 && f.length() > MAX_DEBUG_BYTES) {
+                val old = java.io.File(f.parentFile, "lyric_debug.1.log")
+                runCatching { if (old.exists()) old.delete() }
+                f.renameTo(old)
+            }
             f.appendText(
                 java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US)
                     .format(java.util.Date()) + " " + line + "\n"

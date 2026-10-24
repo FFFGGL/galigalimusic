@@ -24,8 +24,8 @@ android {
         applicationId = "com.galigalimusic.app"
         minSdk = 24
         targetSdk = 36
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = 2
+        versionName = "1.1"
         ndk {
             // whisper.cpp 只编 arm64（真机），缩短原生编译时间
             abiFilters += "arm64-v8a"
@@ -86,6 +86,8 @@ android {
 
     buildFeatures {
         compose = true
+        // 设置页「关于」要读 VERSION_NAME，不能写死版本号
+        buildConfig = true
     }
 }
 
@@ -113,10 +115,7 @@ dependencies {
     implementation("androidx.media3:media3-ui:1.6.1")
     implementation("androidx.media3:media3-session:1.6.1")
 
-    // Network
-    implementation("com.squareup.retrofit2:retrofit:2.11.0")
-    implementation("com.squareup.retrofit2:converter-kotlinx-serialization:2.11.0")
-    implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.8.0")
+    // Network（全部请求走 OkHttp + org.json 手写解析；retrofit 与 kotlinx-serialization 未使用，已移除）
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.10.2")

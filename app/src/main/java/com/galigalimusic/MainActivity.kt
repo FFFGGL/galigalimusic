@@ -66,6 +66,7 @@ class MainActivity : ComponentActivity() {
 
     private lateinit var db: AppDatabase
     private lateinit var repo: MusicRepository
+    private lateinit var playerViewModel: PlayerViewModel
     private var serviceConnection: ServiceConnection? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -96,9 +97,21 @@ class MainActivity : ComponentActivity() {
         }
         bindService(intent, serviceConnection!!, BIND_AUTO_CREATE)
 
+        // 播放器 VM 提升到 Activity 级：主题动态取色（MainActivity）与各页面共用同一实例
+        playerViewModel = androidx.lifecycle.ViewModelProvider(this, object :
+            androidx.lifecycle.ViewModelProvider.Factory {
+            @Suppress("UNCHECKED_CAST")
+            override fun <T : androidx.lifecycle.ViewModel> create(modelClass: Class<T>): T =
+                PlayerViewModel(repo, db, applicationContext) as T
+        })[PlayerViewModel::class.java]
+
         setContent {
             GaligaliMusicTheme {
-                AppRoot(db, repo)
+                androidx.compose.runtime.CompositionLocalProvider(
+                    com.galigalimusic.ui.components.LocalPlayerViewModel provides playerViewModel
+                ) {
+                    AppRoot(db, repo, playerViewModel)
+                }
             }
         }
     }
@@ -112,19 +125,13 @@ class MainActivity : ComponentActivity() {
 private data class NavItem(val route: String, val label: String, val icon: androidx.compose.ui.graphics.vector.ImageVector)
 
 @Composable
-private fun AppRoot(db: AppDatabase, repo: MusicRepository) {
+private fun AppRoot(db: AppDatabase, repo: MusicRepository, playerVm: PlayerViewModel) {
     val navController = rememberNavController()
     val snackbar = remember { SnackbarHostState() }
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
     val toast: (String) -> Unit = { msg -> scope.launch { snackbar.showSnackbar(msg) } }
 
-    val appContext = androidx.compose.ui.platform.LocalContext.current.applicationContext
-    val playerVm: PlayerViewModel = viewModel(factory = object : androidx.lifecycle.ViewModelProvider.Factory {
-        @Suppress("UNCHECKED_CAST")
-        override fun <T : androidx.lifecycle.ViewModel> create(modelClass: Class<T>): T =
-            PlayerViewModel(repo, db, appContext) as T
-    })
     val searchVm: SearchViewModel = viewModel()
     val playlistRepo = remember { com.galigalimusic.data.repository.PlaylistRepository(db) }
 

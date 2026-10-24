@@ -143,18 +143,7 @@ class MusicService : MediaSessionService() {
         player.play()
     }
 
-    fun togglePlay() {
-        val player = getOrCreatePlayer()
-        if (player.isPlaying) player.pause() else player.play()
-    }
-
     fun seekTo(positionMs: Long) = getOrCreatePlayer().seekTo(positionMs)
-
-    fun isPlaying() = getOrCreatePlayer().isPlaying
-
-    fun currentPosition() = getOrCreatePlayer().currentPosition
-
-    fun duration() = getOrCreatePlayer().duration
 
     override fun onBind(intent: Intent?): android.os.IBinder? {
         // 应用内本地绑定走自定义 action；系统媒体会话（通知/锁屏）交由父类处理

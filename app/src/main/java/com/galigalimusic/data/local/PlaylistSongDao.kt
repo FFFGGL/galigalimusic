@@ -33,4 +33,8 @@ interface PlaylistSongDao {
 
     @Query("DELETE FROM playlist_songs WHERE playlistId = :playlistId")
     suspend fun clear(playlistId: String)
+
+    /** 迁移老数据用：删掉 cid=0 的行（这些行补 cid 后以新主键重新插入） */
+    @Query("DELETE FROM playlist_songs WHERE playlistId = :playlistId AND cid = 0")
+    suspend fun deleteZeroCidRows(playlistId: String)
 }

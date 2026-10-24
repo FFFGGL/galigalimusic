@@ -86,6 +86,8 @@ object BilibiliApi {
                         author = m.optJSONObject("upper")?.optString("name").orEmpty(),
                         coverUrl = normalizePic(m.optString("cover")),
                         durationSec = m.optInt("duration", 0),
+                        // 收藏夹视频的 cid 就是 P1 的 cid；带上它，歌单点播不必再查一次
+                        cid = m.optLong("cid", 0L),
                     )
                 )
             }
@@ -104,6 +106,8 @@ object BilibiliApi {
         val author: String,
         val coverUrl: String,
         val durationSec: Int,
+        /** 已知的 cid（收藏夹接口会带）；0 = 未解析，播放时再查 */
+        val cid: Long = 0L,
     )
 
     data class SearchSuggestion(val value: String, val ref: String = "")

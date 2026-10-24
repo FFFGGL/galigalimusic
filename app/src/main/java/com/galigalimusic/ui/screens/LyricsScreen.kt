@@ -46,6 +46,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.galigalimusic.ui.components.LyricScroll
 import com.galigalimusic.viewmodel.PlayerViewModel
+import com.galigalimusic.ui.formatMs
 
 /**
  * 整页歌词（全屏沉浸）：点击播放页歌词区进入。
@@ -132,6 +133,7 @@ fun LyricsScreen(
                                 progress = rProgress,
                                 msg = rMsg,
                                 onClick = { playerVm.recognizeLocally() },
+                                onCancel = { playerVm.cancelRecognize() },
                             )
                         }
                     }

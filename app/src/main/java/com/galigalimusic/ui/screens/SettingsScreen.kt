@@ -4,14 +4,17 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
@@ -33,7 +36,6 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import com.galigalimusic.PlaybackConnection
 import com.galigalimusic.data.remote.BiliSession
 import com.galigalimusic.data.remote.ExternalSources
 import com.galigalimusic.player.MediaCache
@@ -48,21 +50,22 @@ fun SettingsScreen() {
     val context = androidx.compose.ui.platform.LocalContext.current
     val scope = rememberCoroutineScope()
     var cacheBytes by remember { mutableStateOf(0L) }
-    var bassBoost by remember { mutableStateOf(false) }
     LaunchedEffect(Unit) {
         cacheBytes = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { MediaCache.usageBytes(context) }
     }
-    var louder by remember { mutableStateOf(false) }
 
     // AList（WebDAV）配置
     val alistUrl = remember { mutableStateOf(ExternalSources.getUrl(context)) }
     val alistUser = remember { mutableStateOf(ExternalSources.getUser(context)) }
     val alistPass = remember { mutableStateOf(ExternalSources.getPass(context)) }
 
-    fun applyGain() {
-        val gain = if (louder) 1.6f else 1.0f
-        PlaybackConnection.service.value?.setGain(gain)
-    }
+    // 音量增益与播放页共用同一状态（PlayerViewModel.volumeBoost，持久化在 playback prefs）
+    val playerVm = com.galigalimusic.ui.components.LocalPlayerViewModel.current
+    val louder by playerVm.volumeBoost.collectAsState()
+
+    // 本地识别模型 / 语言（持久化在 whisper_prefs）
+    var whisperModel by remember { mutableStateOf(com.galigalimusic.whisper.WhisperLocal.currentModel(context)) }
+    var whisperLang by remember { mutableStateOf(com.galigalimusic.whisper.WhisperLocal.currentLanguage(context)) }
 
     if (showQrLogin) {
         QrLoginDialog(onDismiss = { showQrLogin = false }, onLoggedIn = { showQrLogin = false })
@@ -150,19 +153,79 @@ fun SettingsScreen() {
             Column(Modifier.padding(vertical = 4.dp)) {
                 SettingSwitch(
                     title = "音量增益（+60%）",
-                    subtitle = "播放页底部的声音增强开关与此联动",
+                    subtitle = "与播放页底部的声音增强开关是同一项设置",
                     checked = louder,
-                    onChecked = {
-                        louder = it
-                        applyGain()
-                    },
+                    onChecked = { playerVm.setVolumeBoost(it) },
                 )
-                SettingSwitch(
-                    title = "低音增强",
-                    subtitle = "规划中：均衡器频段（M5 阶段）",
-                    checked = bassBoost,
-                    enabled = false,
-                    onChecked = { bassBoost = it },
+            }
+        }
+        Spacer(Modifier.height(16.dp))
+
+        // 本地识别组
+        Text("本地识别（whisper）", style = MaterialTheme.typography.titleSmall,
+            color = MaterialTheme.colorScheme.primary)
+        Spacer(Modifier.height(6.dp))
+        Surface(
+            color = MaterialTheme.colorScheme.surfaceContainer,
+            shape = RoundedCornerShape(22.dp),
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text(
+                    "B 站没有字幕时，用手机本地把音频转成带时间轴的歌词（完全离线）",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Text("识别模型", style = MaterialTheme.typography.bodyMedium)
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    listOf(
+                        com.galigalimusic.whisper.WhisperLocal.TINY to "tiny · 78MB · 快",
+                        com.galigalimusic.whisper.WhisperLocal.BASE to "base · 148MB · 准",
+                    ).forEach { (m, label) ->
+                        val active = whisperModel?.name == m.name
+                        FilledTonalButton(
+                            onClick = {
+                                com.galigalimusic.whisper.WhisperLocal.setModel(context, m)
+                                whisperModel = m
+                            },
+                            colors = ButtonDefaults.filledTonalButtonColors(
+                                containerColor = if (active) MaterialTheme.colorScheme.primary
+                                else MaterialTheme.colorScheme.surfaceContainerHigh,
+                                contentColor = if (active) MaterialTheme.colorScheme.onPrimary
+                                else MaterialTheme.colorScheme.onSurface,
+                            ),
+                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                        ) { Text(label, style = MaterialTheme.typography.labelSmall) }
+                    }
+                }
+                Text(
+                    "base 更准但首次需下载 148MB；切回 tiny 可省空间",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Text("识别语言", style = MaterialTheme.typography.bodyMedium)
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    listOf("zh" to "中文", "en" to "English", "ja" to "日本語").forEach { (code, label) ->
+                        val active = whisperLang == code
+                        FilledTonalButton(
+                            onClick = {
+                                com.galigalimusic.whisper.WhisperLocal.setLanguage(context, code)
+                                whisperLang = code
+                            },
+                            colors = ButtonDefaults.filledTonalButtonColors(
+                                containerColor = if (active) MaterialTheme.colorScheme.primary
+                                else MaterialTheme.colorScheme.surfaceContainerHigh,
+                                contentColor = if (active) MaterialTheme.colorScheme.onPrimary
+                                else MaterialTheme.colorScheme.onSurface,
+                            ),
+                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                        ) { Text(label, style = MaterialTheme.typography.labelSmall) }
+                    }
+                }
+                Text(
+                    "不要用自动检测：每段只听到 30 秒，片头音乐会把整集误判成外语",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
         }
@@ -260,8 +323,14 @@ fun SettingsScreen() {
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
                 Text(
-                    "AI 字幕歌词 / 本地识别（whisper）/ 歌单体系在后续阶段接入",
+                    "播放内核 Media3 · 本地识别 whisper.cpp（端上离线） · AI 字幕转歌词",
                     style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Text(
+                    // 从 BuildConfig 读真实版本号，避免写死后忘记同步
+                    "版本 ${com.galigalimusic.BuildConfig.VERSION_NAME} · 仅 Android",
+                    style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
@@ -292,7 +361,7 @@ private fun SettingSwitch(
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
-        Spacer(Modifier.height(8.dp))
+        Spacer(Modifier.width(8.dp))
         Switch(checked = checked, onCheckedChange = onChecked, enabled = enabled)
     }
 }

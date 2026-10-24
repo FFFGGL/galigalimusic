@@ -23,6 +23,7 @@ import coil.compose.AsyncImage
 import com.galigalimusic.data.remote.BilibiliApi
 import com.galigalimusic.viewmodel.PlayerViewModel
 import com.galigalimusic.viewmodel.SearchViewModel
+import com.galigalimusic.ui.formatDuration
 
 @Composable
 fun SearchScreen(
@@ -154,10 +155,4 @@ private fun SongRow(song: BilibiliApi.Song, onClick: () -> Unit) {
     }
 }
 
-/** 时长格式化：超过 1 小时用 H:MM:SS（有声书/长视频场景） */
-fun formatDuration(sec: Int): String {
-    val h = sec / 3600
-    val m = (sec % 3600) / 60
-    val s = sec % 60
-    return if (h > 0) "%d:%02d:%02d".format(h, m, s) else "%02d:%02d".format(m, s)
-}
+/** 时长格式化见 [com.galigalimusic.ui.formatDuration]（全工程统一实现） */

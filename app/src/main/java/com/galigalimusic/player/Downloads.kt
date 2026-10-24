@@ -119,19 +119,6 @@ object Downloads {
 
     fun getDownload(key: String): Download? = _list.value.firstOrNull { it.request.id == key }
 
-    fun isCompleted(context: Context, key: String): Boolean {
-        get(context) // 确保初始化
-        val d = getDownload(key)
-        if (d != null) return d.state == Download.STATE_COMPLETED
-        // 快照未初始化时兜底直查
-        return runCatching {
-            manager?.downloadIndex?.getDownload(key)?.state == Download.STATE_COMPLETED
-        }.getOrDefault(false)
-    }
-
-    fun isDownloading(key: String): Boolean =
-        getDownload(key)?.state in setOf(Download.STATE_QUEUED, Download.STATE_DOWNLOADING)
-
     /** 发起下载（progressive 音频 → SimpleCache，键 bvid|cid） */
     fun start(context: Context, bvid: String, cid: Long, title: String, author: String, coverUrl: String, url: String) {
         val key = "$bvid|$cid"
@@ -215,7 +202,11 @@ object Downloads {
             val reason = _lastErrors.value[download.request.id]
             val text = if (failed) "$title · $reason" else title
             val notification = androidx.core.app.NotificationCompat.Builder(context, RESULT_CHANNEL)
-                .setSmallIcon(if (failed) android.R.drawable.stat_notify_error else android.R.drawable.stat_sys_download_done)
+                // 用应用自己的图标：系统 android.R.drawable 在部分 ROM 上显示成白方块
+                .setSmallIcon(
+                    if (failed) android.R.drawable.stat_notify_error
+                    else com.galigalimusic.R.drawable.ic_stat_download
+                )
                 .setContentTitle(if (failed) "下载失败" else "下载完成 ✓")
                 .setContentText(text)
                 .setStyle(androidx.core.app.NotificationCompat.BigTextStyle().bigText(text))

@@ -9,6 +9,8 @@ import com.galigalimusic.data.local.HistoryEntity
 import com.galigalimusic.data.remote.BiliSession
 import com.galigalimusic.data.remote.BilibiliApi
 import com.galigalimusic.data.repository.MusicRepository
+import com.galigalimusic.whisper.WhisperLocal
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -54,6 +56,12 @@ class PlayerViewModel(
     private val _resolving = MutableStateFlow(false)
     val resolving: StateFlow<Boolean> = _resolving
 
+    /** 一次性错误提示（播放器未就绪 / 解析失败等），UI 消费后调用 [clearError] */
+    private val _errorMessage = MutableStateFlow<String?>(null)
+    val errorMessage: StateFlow<String?> = _errorMessage
+
+    fun clearError() { _errorMessage.value = null }
+
     private val _playback = MutableStateFlow(Playback())
     val playback: StateFlow<Playback> = _playback
 
@@ -85,19 +93,28 @@ class PlayerViewModel(
         prefs.edit().remove("lyric_offset_${cur.bvid}_${cur.cid}").apply()
     }
 
+    /** 歌词加载状态 */
     enum class LyricsState { LOADING, NONE, LOADED }
 
-    /** 播放模式：列表循环 / 随机 / 单曲循环 */
+    // 歌词来源用 WhisperLocal.LyricSource（直接 import，不用嵌套 typealias：Room 的 KSP 处理器
+    // 遇到嵌套 typealias 会抛无消息的 IllegalStateException，整条注解处理链失败）
+
+    private val _lyricsSource = MutableStateFlow<WhisperLocal.LyricSource?>(null)
+    val lyricsSource: StateFlow<WhisperLocal.LyricSource?> = _lyricsSource
+
+    /** 播放模式：列表循环 / 随机 / 单曲循环（持久化，重启后恢复） */
     enum class PlayMode { REPEAT_ALL, SHUFFLE, REPEAT_ONE }
 
-    private val _playMode = MutableStateFlow(PlayMode.REPEAT_ALL)
+    private val _playMode = MutableStateFlow(
+        runCatching { PlayMode.valueOf(prefs.getString("play_mode", null) ?: "") }
+            .getOrDefault(PlayMode.REPEAT_ALL)
+    )
     val playMode: StateFlow<PlayMode> = _playMode
 
     /** 播放历史（最近优先），作为上一首/下一首与首页「最近播放」的数据源 */
     val history: StateFlow<List<HistoryEntity>> = repo.history()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
-    private var volumeBoostOn = false
     private var pagesFetchedFor: String? = null
     private var endedHandled = false
 
@@ -223,11 +240,12 @@ class PlayerViewModel(
                         // 播放失败自愈：出错进入 IDLE 且此前确有播放进度时，
                         // 重解析当前曲目并跳回原进度续播（每曲目只自愈一次，防死循环）
                         val cur = _current.value
-                        if (player.playbackState == androidx.media3.common.Player.STATE_IDLE &&
+                        if (cur != null &&
+                            player.playbackState == androidx.media3.common.Player.STATE_IDLE &&
                             !_resolving.value &&
                             (_playback.value.durationMs > 0 || _playback.value.positionMs > 0)
                         ) {
-                            val key = "${cur?.bvid}|${cur?.cid}"
+                            val key = "${cur.bvid}|${cur.cid}"
                             if (errorRetryKey != key) {
                                 errorRetryKey = key
                                 val resumeAt = _playback.value.positionMs
@@ -235,11 +253,11 @@ class PlayerViewModel(
                                 viewModelScope.launch {
                                     runCatching {
                                         val resolved = repo.resolveAndRecord(
-                                            cur!!.bvid, cur.cid, cur.title, cur.author,
+                                            cur.bvid, cur.cid, cur.title, cur.author,
                                             cur.coverUrl,
                                             (_playback.value.durationMs / 1000).toInt(),
                                         )
-                                        svc.playUrl(resolved.url, cur.title, cur.author, cur.coverUrl, "${cur.bvid}|${cur.cid}")
+                                        svc.playUrl(resolved.url, cur.title, cur.author, cur.coverUrl, key)
                                         svc.seekTo(resumeAt)
                                     }
                                     _resolving.value = false
@@ -288,14 +306,16 @@ class PlayerViewModel(
     @Volatile
     private var recognizeCancel = false
 
+    /** 用户在进度状态里主动取消识别（已识别的段落保留） */
     fun cancelRecognize() {
-        recognizeCancel = true
+        if (recognizing) recognizeCancel = true
     }
 
     fun recognizeLocally() {
         val cur = _current.value ?: return
         if (recognizing || cur.bvid.isEmpty() || cur.cid <= 0) return
         recognizing = true
+        recognizeCancel = false
         _recognizeState.value = RecognizeState.DOWNLOADING_MODEL
         _recognizeProgress.value = 0
         _recognizeMsg.value = ""
@@ -304,11 +324,14 @@ class PlayerViewModel(
             var wavFile: java.io.File? = null
             val dbg: (String) -> Unit = { com.galigalimusic.data.remote.BiliSession.appendDebug("recognize: $it") }
             try {
-                // 1. 模型（tiny，约 78MB，hf-mirror，之后完全离线）
-                if (!com.galigalimusic.whisper.WhisperLocal.isModelReady(appContext, com.galigalimusic.whisper.WhisperLocal.TINY)) {
-                    com.galigalimusic.whisper.WhisperLocal.downloadModel(
-                        appContext, com.galigalimusic.whisper.WhisperLocal.TINY
-                    ) { p -> _recognizeProgress.value = p }
+                // 1. 模型：按设置页的选择（默认 base，中文比 tiny 准很多）
+                val wl = com.galigalimusic.whisper.WhisperLocal
+                val model = wl.currentModel(appContext)
+                val language = wl.currentLanguage(appContext)
+                BiliSession.appendDebug("recognize: model=${model.name} lang=$language")
+                val modelReady = wl.isModelReady(appContext, model)
+                if (!modelReady) {
+                    wl.downloadModel(appContext, model) { p -> _recognizeProgress.value = p }
                 }
                 // 2. 音频：优先从播放缓存导出（播放过的字节都在本地，不再重复下载）
                 _recognizeState.value = RecognizeState.DOWNLOADING_AUDIO
@@ -320,14 +343,22 @@ class PlayerViewModel(
                 }.getOrDefault(0L)
                 BiliSession.appendDebug("recognize: cache bytes=$cachedBytes for $cacheKey")
                 audioFile = java.io.File(appContext.cacheDir, "whisper_audio.m4a")
+                var exportedOk = false
                 if (cachedBytes > 512 * 1024) {
                     BiliSession.appendDebug("recognize: export from cache")
                     audioFile.delete()
                     val exported = com.galigalimusic.player.MediaCache.exportToFile(cache, cacheKey, audioFile)
                     BiliSession.appendDebug("recognize: exported $exported bytes")
-                    if (exported <= 0) throw IllegalStateException("缓存导出失败")
-                } else {
-                    // 缓存不足（刚切过来的歌）：重新解析下载，同时回填缓存供下次使用
+                    // 关键校验：SimpleCache 拼出来的字节可能缺 MP4 容器头（m4s 分片），
+                    // 这种文件 MediaExtractor 找不到音频轨、会解出全零 PCM，
+                    // whisper 只会返回空 segments（实测踩过）。校验不过就走重下。
+                    exportedOk = exported > 0 &&
+                        com.galigalimusic.whisper.WhisperAudio.hasParsableAudioTrack(audioFile.absolutePath)
+                    BiliSession.appendDebug("recognize: cache export parsable=$exportedOk")
+                }
+                if (!exportedOk) {
+                    // 缓存不可用或不是完整容器：重新解析并下载完整响应体
+                    // （dash 音频 URL 返回的是带 ftyp/moov 的完整 fMP4，MediaExtractor 能直读）
                     val resolved = repo.resolveAndRecord(
                         cur.bvid, cur.cid, composeHistoryTitle(cur.title, cur.pageLabel),
                         cur.author, cur.coverUrl, 0,
@@ -335,62 +366,175 @@ class PlayerViewModel(
                     com.galigalimusic.whisper.WhisperLocal.downloadAudio(
                         resolved.url, audioFile
                     ) { p -> _recognizeProgress.value = p }
+                    if (!com.galigalimusic.whisper.WhisperAudio.hasParsableAudioTrack(audioFile.absolutePath)) {
+                        throw IllegalStateException("音频无法解析（缺少容器头），该视频可能不支持本地识别")
+                    }
                 }
+                if (recognizeCancel) throw CancellationException("已取消")
                 // 3. 解码+转写流水线：边解码边出句（每 30s 一段立即上屏），不再先解码整集
-                _recognizeState.value = RecognizeState.TRANSCRIBING
+                _recognizeState.value = RecognizeState.DECODING
                 _recognizeProgress.value = 0
                 wavFile = java.io.File(appContext.cacheDir, "whisper_in.wav")
                 val threads = Runtime.getRuntime().availableProcessors().coerceIn(2, 6)
-                val modelPath = com.galigalimusic.whisper.WhisperLocal
-                    .modelFile(appContext, com.galigalimusic.whisper.WhisperLocal.TINY).path
+                val modelPath = wl.modelFile(appContext, model).path
                 val ptr = com.galigalimusic.whisper.WhisperNative.initContext(modelPath)
-                if (ptr == 0L) throw IllegalStateException("模型加载失败")
+                if (ptr == 0L) throw IllegalStateException("模型加载失败，请重装模型后再试")
                 try {
                     val acc = mutableListOf<com.galigalimusic.data.remote.BilibiliApi.LrcLine>()
-                    val totalLines = com.galigalimusic.whisper.WhisperAudio.decodeTranscribeStreaming(
+                    com.galigalimusic.whisper.WhisperAudio.decodeTranscribeStreaming(
                         audioFile!!.absolutePath,
                         wavFile!!,
                         sliceSec = 30,
                         transcribe = { samples ->
+                            // 首段真正进入推理时把状态切到「识别中」
+                            if (_recognizeState.value != RecognizeState.TRANSCRIBING) {
+                                _recognizeState.value = RecognizeState.TRANSCRIBING
+                            }
                             val json = com.galigalimusic.whisper.WhisperNative
-                                .transcribeSamples(ptr, samples, "zh", threads)
+                                .transcribeSamples(ptr, samples, language, threads)
                             BiliSession.appendDebug(
                                 "whisper slice: jsonLen=${json.length} head=${json.take(120)}"
                             )
                             com.galigalimusic.whisper.WhisperLocal.parseNativeJson(json)
                         },
+                        // lines 时间戳已由 WhisperAudio 换算成整集绝对毫秒，这里直接追加
                         onSlice = { lines, idx, _ ->
                             acc += lines
                             _lyrics.value = acc.toList()
                             _lyricsState.value = LyricsState.LOADED
+                            _lyricsSource.value = WhisperLocal.LyricSource.WHISPER
                             _recognizeProgress.value = idx
                             // 增量落盘：每 3 段存一次，取消也不丢已识别内容
                             if (idx % 3 == 0) {
-                                com.galigalimusic.whisper.WhisperLocal.saveLyricCache(appContext, cur.bvid, cur.cid, acc)
+                                com.galigalimusic.whisper.WhisperLocal.saveLyricCache(
+                                    appContext, cur.bvid, cur.cid,
+                                    WhisperLocal.LyricSource.WHISPER, acc,
+                                )
                             }
                         },
                         isCancelled = { recognizeCancel },
+                        debugSink = { dbg(it) },
                     )
-                    if (acc.isEmpty() && !recognizeCancel) throw IllegalStateException("未识别出语音内容")
+                    // 统一收口：有结果就落盘（取消也保留），再按状态给用户明确反馈
                     if (acc.isNotEmpty()) {
-                        com.galigalimusic.whisper.WhisperLocal.saveLyricCache(appContext, cur.bvid, cur.cid, acc)
+                        com.galigalimusic.whisper.WhisperLocal.saveLyricCache(
+                            appContext, cur.bvid, cur.cid,
+                            WhisperLocal.LyricSource.WHISPER, acc,
+                        )
                         _recognizeState.value = RecognizeState.DONE
                         _recognizeProgress.value = 100
-                    } else {
+                        _recognizeMsg.value = if (recognizeCancel) {
+                            "已取消，保留已识别的 ${acc.size} 句"
+                        } else {
+                            "识别完成，共 ${acc.size} 句"
+                        }
+                    } else if (recognizeCancel) {
                         _recognizeState.value = RecognizeState.IDLE
+                        _recognizeProgress.value = 0
+                        _recognizeMsg.value = "已取消"
+                    } else {
+                        throw IllegalStateException("未识别出语音内容，可能是纯音乐或音量过低")
                     }
                 } finally {
                     com.galigalimusic.whisper.WhisperNative.freeContext(ptr)
                 }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                _recognizeState.value = RecognizeState.IDLE
+                _recognizeProgress.value = 0
+                _recognizeMsg.value = "已取消"
             } catch (e: Exception) {
                 dbg("FAILED: $e")
                 _recognizeState.value = RecognizeState.ERROR
-                _recognizeMsg.value = e.message ?: "识别失败"
+                _recognizeMsg.value = friendlyRecognizeError(e)
             } finally {
                 audioFile?.delete()
                 wavFile?.delete()
                 recognizing = false
+                recognizeCancel = false
             }
+        }
+    }
+
+    /** 把底层异常翻译成能看懂的一句话（原始堆栈只进调试日志） */
+    private fun friendlyRecognizeError(e: Exception): String {
+        val m = e.message.orEmpty()
+        return when {
+            e is java.net.UnknownHostException || m.contains("Unable to resolve", true) ->
+                "网络不可用，模型或音频下载失败"
+            e is java.net.SocketTimeoutException -> "网络超时，请检查网络后重试"
+            m.contains("HTTP 4") || m.contains("HTTP 5") -> "下载失败（$m），请稍后重试"
+            m.contains("不完整") -> "模型文件下载不完整，请重试"
+            m.contains("没有音频轨") -> "该音频没有可解码的音轨"
+            m.contains("模型加载失败") -> "识别模型加载失败，请重试或清理后重下"
+            else -> m.take(80).ifEmpty { "识别失败，请重试" }
+        }
+    }
+
+    /**
+     * 歌词切源：在有官方字幕和本地识别结果之间切换。
+     *
+     * 非破坏性：切回官方字幕时**不删** whisper 缓存，用户随时能再切回来。
+     * 想彻底丢弃本地识别结果用 [discardWhisperLyrics]。
+     *
+     * @return true = 切换成功；false = 另一个来源不存在（由调用方提示）
+     */
+    fun switchLyricSource(): Boolean {
+        val cur = _current.value ?: return false
+        val wl = WhisperLocal
+        val hasWhisper = wl.hasWhisperCache(appContext, cur.bvid, cur.cid)
+        if (!hasWhisper) return false
+        return if (_lyricsSource.value == WhisperLocal.LyricSource.WHISPER) {
+            // 切回官方字幕（只换显示，不删缓存）
+            reloadLyricsFromNetwork(cur)
+            true
+        } else {
+            val lines = wl.loadLyricCache(appContext, cur.bvid, cur.cid, WhisperLocal.LyricSource.WHISPER)
+                ?: return false
+            _lyrics.value = lines
+            _lyricsSource.value = WhisperLocal.LyricSource.WHISPER
+            _lyricsState.value = LyricsState.LOADED
+            true
+        }
+    }
+
+    /** 是否有本地识别结果可切（决定 UI 是否显示切源按钮） */
+    fun hasLocalLyrics(): Boolean {
+        val cur = _current.value ?: return false
+        return cur.cid > 0 && WhisperLocal.hasWhisperCache(appContext, cur.bvid, cur.cid)
+    }
+
+    /** 丢弃本地识别结果，让下次起播重新走官方字幕 */
+    fun discardWhisperLyrics() {
+        val cur = _current.value ?: return
+        WhisperLocal.clearWhisperCache(appContext, cur.bvid, cur.cid)
+        if (_lyricsSource.value == WhisperLocal.LyricSource.WHISPER) {
+            reloadLyricsFromNetwork(cur)
+        }
+    }
+
+    /** 重新按网络优先级拉一次歌词（官方字幕 → LRCLIB），不阻塞播放 */
+    private fun reloadLyricsFromNetwork(cur: Current) {
+        viewModelScope.launch {
+            _lyricsState.value = LyricsState.LOADING
+            _lyricsSource.value = null
+            runCatching {
+                val biliLines = BilibiliApi.getSubtitleLrc(cur.bvid, cur.cid)
+                val lines = if (biliLines.isNotEmpty()) biliLines
+                else BilibiliApi.getLrclibLyrics(cur.title, cur.author)
+                _lyrics.value = lines
+                if (lines.isEmpty()) {
+                    _lyricsState.value = LyricsState.NONE
+                } else {
+                    _lyricsState.value = LyricsState.LOADED
+                    val src = if (biliLines.isNotEmpty())
+                        WhisperLocal.LyricSource.BILI
+                    else WhisperLocal.LyricSource.EXT
+                    _lyricsSource.value = src
+                    com.galigalimusic.whisper.WhisperLocal.saveLyricCache(
+                        appContext, cur.bvid, cur.cid, src, lines,
+                    )
+                }
+            }.onFailure { _lyricsState.value = LyricsState.NONE }
         }
     }
 
@@ -414,18 +558,24 @@ class PlayerViewModel(
 
     /** 切换播放模式（循环 → 随机 → 单曲循环），单曲循环走 ExoPlayer 原生 repeatMode */
     fun cyclePlayMode() {
-        _playMode.value = when (_playMode.value) {
+        val next = when (_playMode.value) {
             PlayMode.REPEAT_ALL -> PlayMode.SHUFFLE
             PlayMode.SHUFFLE -> PlayMode.REPEAT_ONE
             PlayMode.REPEAT_ONE -> PlayMode.REPEAT_ALL
         }
+        _playMode.value = next
+        prefs.edit().putString("play_mode", next.name).apply()
+        applyPlayMode(next)
+    }
+
+    /** 把播放模式真正下发到播放器（单曲循环 = ExoPlayer repeatMode ONE） */
+    private fun applyPlayMode(mode: PlayMode) {
         runCatching {
-            PlaybackConnection.service.value
-                ?.setRepeatOne(_playMode.value == PlayMode.REPEAT_ONE)
+            PlaybackConnection.service.value?.setRepeatOne(mode == PlayMode.REPEAT_ONE)
         }
     }
 
-    /** 从歌单曲目播放（cid=0 表示未解析，走默认解析路径） */
+    /** 从歌单曲目播放：cid>0 直接播该分P；cid=0（历史数据）退回 P1 */
     fun playPlaylistTrack(
         bvid: String,
         cid: Long,
@@ -437,30 +587,55 @@ class PlayerViewModel(
         if (cid > 0) {
             startPlayback(bvid, cid, title, author, coverUrl, durationSec)
         } else {
-            play(BilibiliApi.Song(bvid, title, author, coverUrl, durationSec))
+            playPage1(bvid, title, author, coverUrl, durationSec)
         }
     }
 
     /** 搜索结果/BV 直连：默认播 P1，分P 列表随后可从选集切换 */
     fun play(song: BilibiliApi.Song) {
+        playPage1(song.bvid, song.title, song.author, song.coverUrl, song.durationSec, song.cid)
+    }
+
+    /** 播 P1：先取 cid（免一次 view 请求用 song.cid，取不到再查） */
+    private fun playPage1(
+        bvid: String,
+        title: String,
+        author: String,
+        coverUrl: String,
+        durationSec: Int,
+        knownCid: Long = 0L,
+    ) {
         viewModelScope.launch {
             _resolving.value = true
             try {
-                val cid = BilibiliApi.getCid(song.bvid)
+                val cid = if (knownCid > 0L) knownCid else BilibiliApi.getCid(bvid)
                 startPlayback(
-                    bvid = song.bvid,
+                    bvid = bvid,
                     cid = cid,
-                    title = song.title,
-                    author = song.author,
-                    coverUrl = song.coverUrl,
-                    durationSec = song.durationSec,
+                    title = title,
+                    author = author,
+                    coverUrl = coverUrl,
+                    durationSec = durationSec,
                 )
             } catch (e: Exception) {
                 _current.value = null
                 _lyricsState.value = LyricsState.NONE
+                _errorMessage.value = "无法播放：${playErrorMessage(e)}"
             } finally {
                 _resolving.value = false
             }
+        }
+    }
+
+    /** 播放类网络异常的中文化 */
+    private fun playErrorMessage(e: Exception): String {
+        val m = e.message.orEmpty()
+        return when {
+            e is java.net.UnknownHostException || m.contains("Unable to resolve", true) -> "网络不可用"
+            e is java.net.SocketTimeoutException -> "网络超时，请重试"
+            m.contains("视频不存在") -> m
+            m.contains("解析") || m.contains("playurl") -> "获取播放地址失败，请重试"
+            else -> m.take(60).ifEmpty { "解析失败" }
         }
     }
 
@@ -503,11 +678,16 @@ class PlayerViewModel(
         coverUrl: String?,
         sourceTag: String,
     ) {
-        val service = PlaybackConnection.service.value ?: return
+        val service = PlaybackConnection.service.value
+        if (service == null) {
+            _errorMessage.value = "播放器还没准备好，请稍后再试"
+            return
+        }
         val pseudoBvid = "ext:$uri"
         _current.value = Current(title, author, coverUrl ?: "", pseudoBvid, 0L, "")
         _lyricOffsetMs.value = prefs.getLong("lyric_offset_${pseudoBvid}_0", 0L)
         _lyrics.value = emptyList()
+        _lyricsSource.value = null
         _lyricsState.value = LyricsState.LOADING
         _pages.value = emptyList()
         _abPointA.value = null
@@ -525,16 +705,22 @@ class PlayerViewModel(
                 )
             }
             runCatching {
-                val cached = com.galigalimusic.whisper.WhisperLocal.loadLyricCache(appContext, pseudoBvid, 0L)
+                val wl = com.galigalimusic.whisper.WhisperLocal
+                val cached = wl.loadPreferredLyricCache(appContext, pseudoBvid, 0L)
                 if (cached != null) {
-                    _lyrics.value = cached
+                    _lyrics.value = cached.first
+                    _lyricsSource.value = cached.second
                     _lyricsState.value = LyricsState.LOADED
                 } else {
                     val lines = BilibiliApi.getLrclibLyrics(title, author)
                     _lyrics.value = lines
-                    _lyricsState.value = if (lines.isEmpty()) LyricsState.NONE else LyricsState.LOADED
-                    if (lines.isNotEmpty()) {
-                        com.galigalimusic.whisper.WhisperLocal.saveLyricCache(appContext, pseudoBvid, 0L, lines)
+                    if (lines.isEmpty()) {
+                        _lyricsState.value = LyricsState.NONE
+                        _lyricsSource.value = null
+                    } else {
+                        _lyricsState.value = LyricsState.LOADED
+                        _lyricsSource.value = WhisperLocal.LyricSource.EXT
+                        wl.saveLyricCache(appContext, pseudoBvid, 0L, WhisperLocal.LyricSource.EXT, lines)
                     }
                 }
             }.onFailure { _lyricsState.value = LyricsState.NONE }
@@ -569,12 +755,24 @@ class PlayerViewModel(
         durationSec: Int,
         pageLabel: String = "",
     ) {
-        val service = PlaybackConnection.service.value ?: return
+        val service = PlaybackConnection.service.value
+        if (service == null) {
+            _resolving.value = false
+            _errorMessage.value = "播放器还没准备好，请稍后再试"
+            return
+        }
         _resolving.value = true
         _current.value = Current(title, author, coverUrl, bvid, cid, pageLabel)
         _lyricOffsetMs.value = prefs.getLong("lyric_offset_${bvid}_${cid}", 0L)
         _lyrics.value = emptyList()
+        _lyricsSource.value = null
         _lyricsState.value = LyricsState.LOADING
+        // 切歌重置识别态（否则上一集的"识别完成"会挂在新曲目上）
+        if (!recognizing) {
+            _recognizeState.value = RecognizeState.IDLE
+            _recognizeProgress.value = 0
+            _recognizeMsg.value = ""
+        }
         viewModelScope.launch {
             try {
                 // 历史标题带分P 标识：93 集的有声书在历史里能看出听到哪集
@@ -601,12 +799,16 @@ class PlayerViewModel(
                 _abPointB.value = null
                 _current.value = Current(title, author, coverUrl, bvid, cid, pageLabel)
                 _isPlaying.value = true
-                // 歌词：文件缓存优先 → B 站 AI 字幕 → 无则由用户触发本地识别。
+                // 歌词：文件缓存优先（官方字幕 > 本地识别）→ B 站 AI 字幕 → LRCLIB。
                 // 网络类异常在这里吞掉：播放已经开始了，断网不能把 UI 状态清掉
                 runCatching {
-                    val cached = com.galigalimusic.whisper.WhisperLocal.loadLyricCache(appContext, bvid, cid)
+                    val wl = com.galigalimusic.whisper.WhisperLocal
+                    // 清掉旧版不分来源的单文件缓存（无法判断来源，宁可重拉）
+                    wl.dropLegacyLyricCache(appContext, bvid, cid)
+                    val cached = wl.loadPreferredLyricCache(appContext, bvid, cid)
                     if (cached != null) {
-                        _lyrics.value = cached
+                        _lyrics.value = cached.first
+                        _lyricsSource.value = cached.second
                         _lyricsState.value = LyricsState.LOADED
                     } else {
                         // 先 B 站 AI/普通字幕；没有时再查 LRCLIB 同步歌词
@@ -614,9 +816,15 @@ class PlayerViewModel(
                         val lines = if (biliLines.isNotEmpty()) biliLines
                         else BilibiliApi.getLrclibLyrics(title, author)
                         _lyrics.value = lines
-                        _lyricsState.value = if (lines.isEmpty()) LyricsState.NONE else LyricsState.LOADED
-                        if (lines.isNotEmpty()) {
-                            com.galigalimusic.whisper.WhisperLocal.saveLyricCache(appContext, bvid, cid, lines)
+                        if (lines.isEmpty()) {
+                            _lyricsState.value = LyricsState.NONE
+                            _lyricsSource.value = null
+                        } else {
+                            _lyricsState.value = LyricsState.LOADED
+                            val src = if (biliLines.isNotEmpty()) WhisperLocal.LyricSource.BILI
+                            else WhisperLocal.LyricSource.EXT
+                            _lyricsSource.value = src
+                            wl.saveLyricCache(appContext, bvid, cid, src, lines)
                         }
                     }
                 }.onFailure { _lyricsState.value = LyricsState.NONE }
@@ -630,6 +838,7 @@ class PlayerViewModel(
             } catch (e: Exception) {
                 _current.value = null
                 _lyricsState.value = LyricsState.NONE
+                _errorMessage.value = "无法播放：${e.message ?: "解析失败"}"
             } finally {
                 _resolving.value = false
             }
@@ -704,16 +913,27 @@ class PlayerViewModel(
         }
     }
 
+    /** 音量增益（+60%）开关：持久化，播放页与设置页共用同一状态 */
+    private val _volumeBoost = MutableStateFlow(prefs.getBoolean("volume_boost", false))
+    val volumeBoost: StateFlow<Boolean> = _volumeBoost
+
     fun setVolumeBoost(on: Boolean) {
-        volumeBoostOn = on
+        _volumeBoost.value = on
+        prefs.edit().putBoolean("volume_boost", on).apply()
         runCatching { PlaybackConnection.service.value?.setGain(if (on) 1.6f else 1.0f) }
     }
 
-    fun volumeBoostEnabled() = volumeBoostOn
+    fun isVolumeBoostOn(): Boolean = _volumeBoost.value
 
+    /** 播放页面打开时与服务对齐一次（服务可能比 VM 先/后就绪） */
     fun syncState() {
         runCatching {
             _isPlaying.value = PlaybackConnection.service.value?.currentPlayer()?.isPlaying ?: false
+        }
+        runCatching { PlaybackConnection.service.value?.setSpeed(_speed.value) }
+        applyPlayMode(_playMode.value)
+        runCatching {
+            PlaybackConnection.service.value?.setGain(if (_volumeBoost.value) 1.6f else 1.0f)
         }
     }
 }

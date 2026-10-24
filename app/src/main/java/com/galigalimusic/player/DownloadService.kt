@@ -40,7 +40,7 @@ class DownloadService : DownloadService(
             it.state == Download.STATE_DOWNLOADING || it.state == Download.STATE_QUEUED
         }
         return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setSmallIcon(android.R.drawable.stat_sys_download)
+            .setSmallIcon(com.galigalimusic.R.drawable.ic_stat_download)
             .setContentTitle("galigalimusic 离线下载")
             .setContentText(if (active > 0) "正在下载 $active 项" else "下载完成")
             .setOngoing(active > 0)

@@ -62,6 +62,8 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.material3.CircularProgressIndicator
 import coil.compose.AsyncImage
 import com.galigalimusic.viewmodel.PlayerViewModel
+import com.galigalimusic.ui.formatMs
+import com.galigalimusic.ui.formatDuration
 
 /**
  * 全屏播放页（方案 B-②）：强调色氛围背景 + 28dp 圆角封面 + 歌词区 +
@@ -77,12 +79,25 @@ fun PlayerScreen(
     val playback by playerVm.playback.collectAsState()
     val resolving by playerVm.resolving.collectAsState()
     val history by playerVm.history.collectAsState()
-    var boostOn by remember { androidx.compose.runtime.mutableStateOf(playerVm.volumeBoostEnabled()) }
+    val boostOn by playerVm.volumeBoost.collectAsState()
     var seeking by remember { mutableStateOf<Float?>(null) }
 
     val cur = current
     val cs = MaterialTheme.colorScheme
     var showSleepTimer by remember { mutableStateOf(false) }
+
+    // 进页面时与服务对齐（倍速/单曲循环/增益可能在进程重启后丢失）
+    LaunchedEffect(Unit) { playerVm.syncState() }
+
+    // 解析失败/播放器未就绪等一次性提示：用本地快照展示，再清 VM 侧状态
+    var errorSnack by remember { mutableStateOf<String?>(null) }
+    val errorMsg by playerVm.errorMessage.collectAsState()
+    LaunchedEffect(errorMsg) {
+        errorMsg?.let {
+            errorSnack = it
+            playerVm.clearError()
+        }
+    }
     Box(
         modifier = Modifier
             .fillMaxSize()
@@ -96,6 +111,28 @@ fun PlayerScreen(
                 )
             ),
     ) {
+        // 一次性错误条（解析失败/播放器未就绪），5 秒后自动消失
+        val snack = errorSnack
+        if (snack != null) {
+            LaunchedEffect(snack) {
+                kotlinx.coroutines.delay(5000)
+                errorSnack = null
+            }
+            Surface(
+                color = cs.errorContainer,
+                contentColor = cs.onErrorContainer,
+                shape = RoundedCornerShape(14.dp),
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .padding(horizontal = 16.dp, vertical = 8.dp),
+            ) {
+                Text(
+                    snack,
+                    style = MaterialTheme.typography.bodySmall,
+                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+                )
+            }
+        }
         Column(
             modifier = Modifier
                 .fillMaxSize()
@@ -203,7 +240,6 @@ fun PlayerScreen(
             val pages by playerVm.pages.collectAsState()
             val speed by playerVm.speed.collectAsState()
             var showPages by remember { mutableStateOf(false) }
-            var showSleepTimer by remember { mutableStateOf(false) }
             Spacer(Modifier.height(8.dp))
             Row(
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -257,6 +293,7 @@ fun PlayerScreen(
             val abB by playerVm.abPointB.collectAsState()
             val skipHead by playerVm.skipHeadSec.collectAsState()
             val skipTail by playerVm.skipTailSec.collectAsState()
+            val lyricsState by playerVm.lyricsState.collectAsState()
             var showSkipDialog by remember { mutableStateOf(false) }
             Spacer(Modifier.height(6.dp))
             Row(
@@ -293,6 +330,51 @@ fun PlayerScreen(
                         style = MaterialTheme.typography.labelMedium,
                         modifier = Modifier.padding(horizontal = 14.dp, vertical = 6.dp),
                     )
+                }
+                // 歌词偏移：听书场景延迟字幕很常见，播放页也要能顺手调，不必进整页歌词
+                if (lyricsState == PlayerViewModel.LyricsState.LOADED) {
+                    val offsetMs by playerVm.lyricOffsetMs.collectAsState()
+                    Surface(
+                        color = if (offsetMs != 0L) cs.primary else cs.secondaryContainer,
+                        contentColor = if (offsetMs != 0L) cs.onPrimary else cs.onSecondaryContainer,
+                        shape = RoundedCornerShape(999.dp),
+                        modifier = Modifier.clickable {
+                            if (offsetMs != 0L) playerVm.resetLyricOffset()
+                            else playerVm.adjustLyricOffset(500L)
+                        },
+                    ) {
+                        Text(
+                            if (offsetMs == 0L) "字幕偏移" else "偏移 ${if (offsetMs > 0) "+" else ""}${offsetMs / 1000.0}s · 点此归零",
+                            style = MaterialTheme.typography.labelMedium,
+                            modifier = Modifier.padding(horizontal = 14.dp, vertical = 6.dp),
+                        )
+                    }
+                }
+                // 歌词来源 + 切源：让用户清楚现在用的是官方字幕还是本地识别，
+                // 且能一键互换（两者共存，不是覆盖关系）
+                val lyricsSrc by playerVm.lyricsSource.collectAsState()
+                if (lyricsState == PlayerViewModel.LyricsState.LOADED && lyricsSrc != null) {
+                    val isWhisper =
+                        lyricsSrc == com.galigalimusic.whisper.WhisperLocal.LyricSource.WHISPER
+                    val canSwitch = playerVm.hasLocalLyrics()
+                    Surface(
+                        color = if (isWhisper) cs.tertiary else cs.secondaryContainer,
+                        contentColor = if (isWhisper) cs.onTertiary else cs.onSecondaryContainer,
+                        shape = RoundedCornerShape(999.dp),
+                        modifier = Modifier.clickable(enabled = canSwitch) {
+                            playerVm.switchLyricSource()
+                        },
+                    ) {
+                        Text(
+                            when {
+                                !canSwitch -> if (isWhisper) "本地识别字幕" else "B站字幕"
+                                isWhisper -> "本地识别 · 换回官方"
+                                else -> "B站官方 · 用本地识别"
+                            },
+                            style = MaterialTheme.typography.labelMedium,
+                            modifier = Modifier.padding(horizontal = 14.dp, vertical = 6.dp),
+                        )
+                    }
                 }
             }
             if (showSkipDialog) {
@@ -331,7 +413,6 @@ fun PlayerScreen(
 
             // 歌词区：B 站 AI 字幕优先，随播放居中滚动；点击进整页歌词
             val lyrics by playerVm.lyrics.collectAsState()
-            val lyricsState by playerVm.lyricsState.collectAsState()
             val recognizeState by playerVm.recognizeState.collectAsState()
             val recognizeProgress by playerVm.recognizeProgress.collectAsState()
             val recognizeMsg by playerVm.recognizeMsg.collectAsState()
@@ -345,6 +426,7 @@ fun PlayerScreen(
                 recognizeProgress = recognizeProgress,
                 recognizeMsg = recognizeMsg,
                 onRecognize = { playerVm.recognizeLocally() },
+                onCancelRecognize = { playerVm.cancelRecognize() },
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(150.dp),
@@ -443,10 +525,7 @@ fun PlayerScreen(
                     )
                     Switch(
                         checked = boostOn,
-                        onCheckedChange = {
-                            boostOn = it
-                            playerVm.setVolumeBoost(it)
-                        },
+                        onCheckedChange = { playerVm.setVolumeBoost(it) },
                     )
                 }
             }
@@ -454,14 +533,7 @@ fun PlayerScreen(
     }
 }
 
-/** 时长格式化：超过 1 小时用 H:MM:SS（有声书场景） */
-fun formatMs(ms: Long): String {
-    val totalSec = ms / 1000
-    val h = totalSec / 3600
-    val m = (totalSec % 3600) / 60
-    val s = totalSec % 60
-    return if (h > 0) "%d:%02d:%02d".format(h, m, s) else "%02d:%02d".format(m, s)
-}
+/** 时长格式化统一实现在 [com.galigalimusic.ui.formatMs] */
 
 /**
  * 本地识别按钮：无字幕时的兜底。状态机驱动文案与进度（模型下载/音频下载/解码/推理）。
@@ -472,6 +544,7 @@ fun RecognizeButton(
     progress: Int,
     msg: String,
     onClick: () -> Unit,
+    onCancel: () -> Unit = {},
 ) {
     val busy = state in setOf(
         com.galigalimusic.viewmodel.PlayerViewModel.RecognizeState.DOWNLOADING_MODEL,
@@ -481,17 +554,34 @@ fun RecognizeButton(
     )
     val cs = MaterialTheme.colorScheme
     Column(horizontalAlignment = Alignment.CenterHorizontally) {
-        Surface(
-            color = cs.secondaryContainer,
-            contentColor = cs.onSecondaryContainer,
-            shape = RoundedCornerShape(999.dp),
-            modifier = Modifier.clickable(enabled = !busy) { onClick() },
-        ) {
-            Text(
-                if (busy) "识别中…" else "🎤 本地识别生成歌词",
-                style = MaterialTheme.typography.labelMedium,
-                modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
-            )
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Surface(
+                color = cs.secondaryContainer,
+                contentColor = cs.onSecondaryContainer,
+                shape = RoundedCornerShape(999.dp),
+                modifier = Modifier.clickable(enabled = !busy) { onClick() },
+            ) {
+                Text(
+                    if (busy) "识别中…" else "🎤 本地识别生成歌词",
+                    style = MaterialTheme.typography.labelMedium,
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+                )
+            }
+            // 识别可能跑十几分钟，必须能中途停（已识别部分会保留）
+            if (busy) {
+                Surface(
+                    color = cs.surfaceContainerHigh,
+                    contentColor = cs.onSurfaceVariant,
+                    shape = RoundedCornerShape(999.dp),
+                    modifier = Modifier.clickable { onCancel() },
+                ) {
+                    Text(
+                        "取消",
+                        style = MaterialTheme.typography.labelMedium,
+                        modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp),
+                    )
+                }
+            }
         }
         if (busy) {
             Spacer(Modifier.height(6.dp))
@@ -517,7 +607,11 @@ fun RecognizeButton(
         }
         if (state == com.galigalimusic.viewmodel.PlayerViewModel.RecognizeState.DONE) {
             Spacer(Modifier.height(4.dp))
-            Text("识别完成 ✓", style = MaterialTheme.typography.labelSmall, color = cs.primary)
+            Text(
+                msg.ifEmpty { "识别完成 ✓" },
+                style = MaterialTheme.typography.labelSmall,
+                color = cs.primary,
+            )
         }
         if (state == com.galigalimusic.viewmodel.PlayerViewModel.RecognizeState.ERROR) {
             Spacer(Modifier.height(4.dp))
@@ -700,6 +794,7 @@ private fun LyricPanel(
     recognizeProgress: Int,
     recognizeMsg: String,
     onRecognize: () -> Unit,
+    onCancelRecognize: () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     val cs = MaterialTheme.colorScheme
@@ -725,6 +820,7 @@ private fun LyricPanel(
                             progress = recognizeProgress,
                             msg = recognizeMsg,
                             onClick = onRecognize,
+                            onCancel = onCancelRecognize,
                         )
                     }
                 }

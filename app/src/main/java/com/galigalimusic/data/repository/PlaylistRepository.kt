@@ -60,16 +60,37 @@ class PlaylistRepository(private val db: AppDatabase) {
         val songs = BilibiliApi.getFavVideos(mediaId)
         val known = db.playlistSongDao().getSongs(id).map { it.bvid }.toHashSet()
         val fresh = songs.filter { it.bvid !in known }
-        val base = db.playlistSongDao().maxPosition(id) + 1
+        var base = db.playlistSongDao().maxPosition(id) + 1
         if (fresh.isNotEmpty()) {
             db.playlistSongDao().upsertAll(fresh.mapIndexed { i, s ->
                 PlaylistSongEntity(
-                    playlistId = id, bvid = s.bvid, cid = 0L,
+                    playlistId = id, bvid = s.bvid,
+                    // 带上接口返回的 cid：否则多P 有声书从歌单点播永远回到 P1
+                    cid = s.cid,
                     title = s.title, author = s.author, coverUrl = s.coverUrl,
                     durationSec = s.durationSec, position = base + i,
                 )
             })
+            base += fresh.size
         }
+
+        // 老数据补全：历史导入的 cid 全是 0，而主键含 cid 不能原地改 →
+        // 先记下原 position，删掉 cid=0 的行，再按补好的 cid 以原 position 重插
+        runCatching {
+            val stale = db.playlistSongDao().getSongs(id).filter { it.cid <= 0L }
+            if (stale.isNotEmpty()) {
+                val cidByBvid = songs.associate { it.bvid to it.cid }
+                val fixed = stale.map { row ->
+                    val c = cidByBvid[row.bvid] ?: 0L
+                    if (c > 0L) row.copy(cid = c)
+                    else row.copy(position = base + row.position) // 查不到 cid 的保序挪到末尾
+                }
+                db.playlistSongDao().deleteZeroCidRows(id)
+                // 补到 cid 的按原 position 插回；查不到的（已失效）本来就该留在原位，一并插回
+                db.playlistSongDao().upsertAll(fixed)
+            }
+        }
+
         db.playlistDao().markFavSynced(id, mediaId, System.currentTimeMillis())
         return id to fresh.size
     }

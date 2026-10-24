@@ -31,6 +31,7 @@ import coil.compose.AsyncImage
 import com.galigalimusic.ui.theme.ThemeEngine
 import com.galigalimusic.viewmodel.PlayerViewModel
 import java.util.concurrent.TimeUnit
+import com.galigalimusic.ui.formatDuration
 
 /**
  * 首页（方案 B 内容流）：问候 + 继续听 hero 卡 + 快捷开始 + 最近播放。

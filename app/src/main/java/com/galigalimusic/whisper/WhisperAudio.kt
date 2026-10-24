@@ -25,12 +25,75 @@ object WhisperAudio {
     private const val TAG = "WhisperAudio"
     const val OUT_RATE = 16000
 
+    /** 段间重叠秒数：给 whisper 一点上文，避免每段开头硬切句子 */
+    private const val SLICE_OVERLAP_SEC = 2
+
+    /** PCM 峰值低于这个值视为「解出来是静音」——正常语音远高于此（约 0.05~0.9） */
+    private const val MIN_PEAK = 0.003
+
+    /**
+     * 把单段转写结果贴到整集时间轴上。
+     *
+     * 关键点：whisper 返回的 t0/t1 是**相对本段输入起点**的毫秒；
+     * 本段输入起点 = sliceStart(样本) - 重叠区，所以绝对时间 = t + baseMs。
+     * 落在外层已输出区间（绝对时间 < prevEndMs）的句子属于重叠区残留，丢弃。
+     */
+    private fun shiftLines(
+        lines: List<com.galigalimusic.data.remote.BilibiliApi.LrcLine>,
+        baseMs: Long,
+        prevEndMs: Long,
+        audioEndMs: Long,
+    ): List<com.galigalimusic.data.remote.BilibiliApi.LrcLine> =
+        lines.mapNotNull { l ->
+            val s = (l.startMs + baseMs).coerceAtLeast(0L)
+            val e = (l.endMs + baseMs).coerceAtLeast(s)
+            if (s + MIN_LINE_MS < prevEndMs) return@mapNotNull null // 重叠区内的重复句
+            com.galigalimusic.data.remote.BilibiliApi.LrcLine(
+                startMs = s,
+                endMs = minOf(e, audioEndMs).coerceAtLeast(s),
+                text = l.text,
+            )
+        }
+
+    private const val MIN_LINE_MS = 100L
+
+    /**
+     * 判断一个文件是否是 MediaExtractor 能解析的容器。
+     *
+     * 背景：MediaCache.exportToFile 从 SimpleCache 里按 span 拼出来的字节，
+     * 是 HTTP 响应体的原始缓存，**不含 MP4 容器头（ftyp/moov）**，
+     * 对 B 站 dash 音频来说通常是 m4s 分片，MediaExtractor 会读不到任何轨道
+     * → 解出全零 PCM → whisper 返回空 segments（本次真机实测就是这个现象）。
+     *
+     * 这里用「能不能真的读到音频轨」作为判据，比只看文件头可靠：
+     * 有 ftyp 缺 moov 的文件同样解析不了。
+     */
+    fun hasParsableAudioTrack(path: String): Boolean = try {
+        val ex = MediaExtractor()
+        try {
+            ex.setDataSource(path)
+            (0 until ex.trackCount).any { i ->
+                ex.getTrackFormat(i).getString(MediaFormat.KEY_MIME)
+                    ?.startsWith("audio/") == true
+            }
+        } finally {
+            runCatching { ex.release() }
+        }
+    } catch (e: Exception) {
+        false
+    }
+
     /**
      * 流式解码并分块转写。
      * @param transcribe 一段 float PCM（16k 单声道）→ 歌词行（时间戳相对该段起点）
-     * @param onSlice 每段转写完成的回调（歌词行、完成段数、该段起点样本数）
+     * @param onSlice 每段转写完成的回调（歌词行、完成段数、该段起点样本数）；
+     *                歌词行时间戳**已换算成整集绝对毫秒**，调用方直接追加即可
      * @param isCancelled 外部取消钩子（每轮输入/输出检查一次）
      * @return 总歌词行数
+     *
+     * 注意：段与段之间带 [SLICE_OVERLAP_SEC] 重叠。whisper 对"从句中开始"的输入很敏感，
+     * 硬切会让被切断的半句被当成新句、并带上静音 padding 导致该段整体偏后。
+     * 重叠区的重复句子由 [shiftLines] 按绝对时间过滤掉。
      */
     fun decodeTranscribeStreaming(
         inputPath: String,
@@ -39,6 +102,7 @@ object WhisperAudio {
         transcribe: (FloatArray) -> List<com.galigalimusic.data.remote.BilibiliApi.LrcLine>,
         onSlice: (List<com.galigalimusic.data.remote.BilibiliApi.LrcLine>, Int, Long) -> Unit,
         isCancelled: () -> Boolean,
+        debugSink: ((String) -> Unit)? = null,
     ): Int {
         val extractor = MediaExtractor()
         extractor.setDataSource(inputPath)
@@ -66,22 +130,31 @@ object WhisperAudio {
 
         var totalLines = 0
         var sliceIdx = 0
-        var sliceStart = 0L // 本段起点（16k 样本数）
+        var sliceStart = 0L // 本段**新内容**起点（16k 样本数，已排除重叠区）
         var pcmFrames = 0L // 已写入的 16k 样本数
+        var lastEmittedMs = 0L // 已输出的最大绝对时间（重叠区去重用）
         var bucketAcc = 0.0
         var bucketCount = 0
         var consumedFrames = 0L
         var nextBucketEnd = 0.0
         val sliceSamples = sliceSec.toLong() * OUT_RATE
+        val overlapSamples = SLICE_OVERLAP_SEC.toLong() * OUT_RATE
 
         var pcmEncoding = android.media.AudioFormat.ENCODING_PCM_16BIT
         var outSampleRate = inputFormat.getInteger(KEY_SAMPLE_RATE)
         var outChannels = inputFormat.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
 
+        // 音频能量峰值：用于识别「解出来全是静音/全零」的坏输入。
+        // 缺容器头、错误解码器、纯空轨都会表现成这种情况，
+        // 若不早停，用户要等十几分钟才看到「未识别出语音内容」。
+        var peak = 0.0
+
         fun emit(frame: Int, channels: Int, getSample: (Int) -> Double) {
             var m = 0.0
             for (c in 0 until channels) m += getSample(frame * channels + c)
             val mono = m / channels
+            if (mono > peak) peak = mono
+            if (-mono > peak) peak = -mono
             bucketAcc += mono
             bucketCount++
             consumedFrames++
@@ -102,11 +175,49 @@ object WhisperAudio {
             dos.flush() // 先落盘再读
             val count = if (final) untranscribed.toInt() else sliceSamples.toInt()
             if (count < OUT_RATE / 2) return // 尾巴不足半秒不识别
-            val samples = readSlice(pcmFile, 44, sliceStart, count)
+            // 解码出的 PCM 能量低到近似静音 → 输入本身有问题（缺容器头/解码失败），
+            // 直接抛错而不是把几十段空结果跑完
+            if (peak < MIN_PEAK) {
+                throw IllegalStateException(
+                    "音频解码为空（信号峰值 ${"%.4f".format(peak)}），文件可能缺少容器头"
+                )
+            }
+            // 本段输入带前置重叠：取 [sliceStart - overlap, sliceStart + count)
+            val from = (sliceStart - overlapSamples).coerceAtLeast(0L)
+            val realCount = (count + (sliceStart - from)).toInt()
+            val samples = readSlice(pcmFile, 44, from, realCount)
+            // 诊断：仅前 2 段输出 PCM 特征（RMS/峰值），用于排查「静音/解码错位」类失败；
+            // 不逐段打印，避免长音频把日志刷爆
+            if (debugSink != null && sliceIdx < 2) {
+                var sum = 0.0
+                var pk = 0.0
+                for (s in samples) {
+                    sum += s.toDouble() * s
+                    val a = if (s < 0) -s else s
+                    if (a > pk) pk = a.toDouble()
+                }
+                val rms = if (samples.isNotEmpty()) kotlin.math.sqrt(sum / samples.size) else 0.0
+                debugSink(
+                    "pcm slice#$sliceIdx from=$from count=${samples.size} " +
+                    "rms=${"%.5f".format(rms)} peak=${"%.5f".format(pk)} rate=$outSampleRate ch=$outChannels"
+                )
+            }
             val lines = transcribe(samples)
-            if (lines.isNotEmpty()) {
-                totalLines += lines.size
-                onSlice(lines, ++sliceIdx, sliceStart)
+            // 相对位移 → 绝对时间轴（本段输入起点 = from）
+            val baseMs = from * 1000L / OUT_RATE
+            val audioEndMs = pcmFrames.coerceAtLeast(sliceStart + count) * 1000L / OUT_RATE
+            val shifted = shiftLines(lines, baseMs, lastEmittedMs, audioEndMs)
+            // 打平时间轴：whisper 分句可能首尾相接或轻微重叠，
+            // 让每行 endMs 不超过下一行 startMs（避免卡拉 OK 高亮"卡在上一句"）
+            val flattened = shifted.mapIndexed { i, line ->
+                val next = shifted.getOrNull(i + 1)
+                if (next != null && line.endMs > next.startMs) line.copy(endMs = next.startMs) else line
+            }
+            if (flattened.isNotEmpty()) {
+                totalLines += flattened.size
+                lastEmittedMs = flattened.maxOf { it.endMs }
+                // 回调里的偏移参数固定按「样本」语义给出（= from），与注释一致
+                onSlice(flattened, ++sliceIdx, from)
             }
             sliceStart += count
         }
