@@ -154,6 +154,10 @@ class PlayerViewModel(
     // ===== 播放失败自愈（URL 过期等 Source error → 重解析续播一次） =====
     private var errorRetryKey: String? = null
 
+    // ===== 收听计时（播放统计） =====
+    private var listenAccumMs = 0L
+    private var lastListenTickAt = System.currentTimeMillis()
+
     // ===== AB 循环 =====
     private val _abPointA = MutableStateFlow<Long?>(null)
     val abPointA: StateFlow<Long?> = _abPointA
@@ -271,6 +275,25 @@ class PlayerViewModel(
                     }
                 } else {
                     _playback.value = Playback(isPlaying = _isPlaying.value)
+                }
+
+                // 收听计时：播放中按真实时间累计，每 15 秒刷库一次（暂停不计，seek 跳跃不计）
+                val nowMs = System.currentTimeMillis()
+                if (_isPlaying.value && _current.value != null) {
+                    listenAccumMs += (nowMs - lastListenTickAt).coerceIn(0L, 5_000L)
+                }
+                lastListenTickAt = nowMs
+                if (listenAccumMs >= 15_000) {
+                    val cur = _current.value
+                    if (cur != null) {
+                        val sec = listenAccumMs / 1000
+                        listenAccumMs %= 1000
+                        viewModelScope.launch {
+                            runCatching { repo.addListenTime(cur.bvid, cur.cid, sec) }
+                        }
+                    } else {
+                        listenAccumMs = 0
+                    }
                 }
 
                 // 定时关闭
@@ -697,10 +720,13 @@ class PlayerViewModel(
             runCatching { service.setSpeed(_speed.value) }
             _isPlaying.value = true
             runCatching {
+                // 保留累计收听时长（REPLACE 语义会整行覆盖）
+                val prev = runCatching { repo.getHistoryKey(pseudoBvid, 0L) }.getOrNull()
                 repo.upsertHistory(
                     HistoryEntity(
                         bvid = pseudoBvid, cid = 0L, title = title, author = author,
                         coverUrl = coverUrl ?: "", durationSec = 0,
+                        listenedSec = prev?.listenedSec ?: 0L,
                     )
                 )
             }

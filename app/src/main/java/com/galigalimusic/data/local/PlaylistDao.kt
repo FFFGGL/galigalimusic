@@ -14,6 +14,12 @@ interface PlaylistDao {
     @Query("SELECT * FROM playlists ORDER BY createdAt DESC")
     fun observeAll(): Flow<List<PlaylistEntity>>
 
+    @Query("SELECT * FROM playlists ORDER BY createdAt DESC")
+    suspend fun getAll(): List<PlaylistEntity>
+
+    @Query("SELECT * FROM playlists WHERE title = :title LIMIT 1")
+    suspend fun getByTitle(title: String): PlaylistEntity?
+
     @Query("SELECT * FROM playlists WHERE id = :id LIMIT 1")
     suspend fun getById(id: String): PlaylistEntity?
 

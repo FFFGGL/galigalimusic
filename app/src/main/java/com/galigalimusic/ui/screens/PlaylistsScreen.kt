@@ -1,5 +1,7 @@
 package com.galigalimusic.ui.screens
 
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -8,12 +10,15 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Add
 import androidx.compose.material.icons.rounded.CloudDownload
+import androidx.compose.material.icons.rounded.FileDownload
+import androidx.compose.material.icons.rounded.FileUpload
 import androidx.compose.material.icons.automirrored.rounded.QueueMusic
 import androidx.compose.material.icons.rounded.Sync
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
@@ -106,6 +111,28 @@ class PlaylistsViewModel(private val repo: PlaylistRepository) : ViewModel() {
     fun resetImport() {
         _importState.value = ImportState.Idle
     }
+
+    // ===== 备份导出 / 导入 =====
+    fun exportJson(onReady: (String) -> Unit, onError: (String) -> Unit) {
+        viewModelScope.launch {
+            runCatching { repo.exportJson() }
+                .onSuccess(onReady)
+                .onFailure { onError(it.message ?: "导出失败") }
+        }
+    }
+
+    fun importJson(text: String, onDone: (String) -> Unit) {
+        viewModelScope.launch {
+            runCatching { repo.importJson(text) }
+                .onSuccess { (pl, songs) ->
+                    onDone(
+                        if (pl == 0 && songs == 0) "没有新内容（可能全部已存在）"
+                        else "导入完成：$pl 个歌单 / $songs 首歌曲 ✓"
+                    )
+                }
+                .onFailure { onDone("导入失败：${it.message ?: "文件格式不对"}") }
+        }
+    }
 }
 
 @Composable
@@ -127,11 +154,60 @@ fun PlaylistsScreen(
     var showCreate by remember { mutableStateOf(false) }
     var showImport by remember { mutableStateOf(false) }
 
-    Column(modifier = Modifier.fillMaxSize().padding(horizontal = 16.dp)) {
-        Spacer(Modifier.height(16.dp))
+    // 备份导出/导入：系统文件选择器（SAF），无需存储权限
+    val context = LocalContext.current
+    var pendingExport by remember { mutableStateOf<String?>(null) }
+    val scope = rememberCoroutineScope()
+    val exportLauncher = rememberLauncherForActivityResult(
+        androidx.activity.result.contract.ActivityResultContracts.CreateDocument("application/json")
+    ) { uri ->
+        val json = pendingExport
+        if (uri != null && json != null) {
+            scope.launch {
+                runCatching {
+                    context.contentResolver.openOutputStream(uri)?.use { it.write(json.toByteArray()) }
+                }.onSuccess { onToast("已导出备份") }
+                    .onFailure { onToast("导出失败：${it.message}") }
+            }
+        }
+        pendingExport = null
+    }
+    val importLauncher = rememberLauncherForActivityResult(
+        androidx.activity.result.contract.ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        if (uri != null) {
+            scope.launch {
+                val text = runCatching {
+                    context.contentResolver.openInputStream(uri)?.bufferedReader()?.readText()
+                }.getOrNull()
+                if (text.isNullOrEmpty()) onToast("读取文件失败")
+                else vm.importJson(text, onToast)
+            }
+        }
+    }
+
+    Column(modifier = Modifier.fillMaxSize().padding(horizontal = 16.dp)) {        Spacer(Modifier.height(16.dp))
         Row(verticalAlignment = Alignment.CenterVertically) {
             Text("歌单", style = MaterialTheme.typography.headlineSmall)
             Spacer(Modifier.weight(1f))
+            IconButton(onClick = {
+                vm.exportJson(
+                    onReady = { json ->
+                        pendingExport = json
+                        val stamp = java.text.SimpleDateFormat("yyyyMMdd_HHmm", java.util.Locale.US)
+                            .format(java.util.Date())
+                        exportLauncher.launch("galigali-playlists-$stamp.json")
+                    },
+                    onError = onToast,
+                )
+            }) {
+                Icon(Icons.Rounded.FileDownload, contentDescription = "导出备份")
+            }
+            IconButton(onClick = {
+                importLauncher.launch(arrayOf("application/json", "text/plain"))
+            }) {
+                Icon(Icons.Rounded.FileUpload, contentDescription = "导入备份")
+            }
             IconButton(onClick = { vm.resetImport(); showImport = true }) {
                 Icon(Icons.Rounded.CloudDownload, contentDescription = "导入 B 站收藏夹")
             }

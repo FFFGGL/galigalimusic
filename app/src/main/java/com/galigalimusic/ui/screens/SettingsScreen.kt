@@ -67,6 +67,12 @@ fun SettingsScreen() {
     var whisperModel by remember { mutableStateOf(com.galigalimusic.whisper.WhisperLocal.currentModel(context)) }
     var whisperLang by remember { mutableStateOf(com.galigalimusic.whisper.WhisperLocal.currentLanguage(context)) }
 
+    // 检查更新：first = 有新版本时的 release 信息；second = 行内提示文案
+    var updateChecking by remember { mutableStateOf(false) }
+    var updateInfo by remember {
+        mutableStateOf<Pair<com.galigalimusic.data.remote.GitHubRelease.Info?, String?>>(null to null)
+    }
+
     if (showQrLogin) {
         QrLoginDialog(onDismiss = { showQrLogin = false }, onLoggedIn = { showQrLogin = false })
     }
@@ -333,9 +339,77 @@ fun SettingsScreen() {
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
+                Spacer(Modifier.height(6.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    OutlinedButton(
+                        onClick = {
+                            scope.launch {
+                                updateChecking = true
+                                val info = com.galigalimusic.data.remote.GitHubRelease.latest()
+                                updateChecking = false
+                                updateInfo = when {
+                                    info == null -> null to "检查失败，请稍后重试"
+                                    com.galigalimusic.data.remote.GitHubRelease.isNewer(
+                                        info.version,
+                                        com.galigalimusic.BuildConfig.VERSION_NAME,
+                                    ) -> info to "发现新版本 ${info.version}"
+                                    else -> null to "已是最新版本 ✓"
+                                }
+                            }
+                        },
+                        enabled = !updateChecking,
+                    ) { Text(if (updateChecking) "检查中…" else "检查更新") }
+                    updateInfo.second?.let { msg ->
+                        Spacer(Modifier.width(10.dp))
+                        Text(
+                            msg,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = if (updateInfo.first != null) MaterialTheme.colorScheme.primary
+                            else MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
             }
         }
         Spacer(Modifier.height(20.dp))
+    }
+
+    // 检查更新结果对话框 + 行内提示 4 秒自动消失
+    val (foundUpdate, updateMsg) = updateInfo
+    if (updateMsg != null) {
+        LaunchedEffect(updateMsg) {
+            kotlinx.coroutines.delay(4000)
+            if (updateInfo.second == updateMsg) updateInfo = foundUpdate to null
+        }
+    }
+    if (foundUpdate != null) {
+        AlertDialog(
+            onDismissRequest = { updateInfo = null to null },
+            title = { Text("发现新版本 ${foundUpdate.version}") },
+            text = {
+                Text(
+                    foundUpdate.notes.ifEmpty { "（无更新说明）" },
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    val url = foundUpdate.apkUrl ?: foundUpdate.pageUrl
+                    runCatching {
+                        context.startActivity(
+                            android.content.Intent(
+                                android.content.Intent.ACTION_VIEW,
+                                android.net.Uri.parse(url),
+                            )
+                        )
+                    }
+                    updateInfo = null to null
+                }) { Text("去下载") }
+            },
+            dismissButton = {
+                TextButton(onClick = { updateInfo = null to null }) { Text("稍后") }
+            },
+        )
     }
 }
 

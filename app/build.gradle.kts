@@ -24,8 +24,8 @@ android {
         applicationId = "com.galigalimusic.app"
         minSdk = 24
         targetSdk = 36
-        versionCode = 2
-        versionName = "1.1"
+        versionCode = 3
+        versionName = "1.2"
         ndk {
             // whisper.cpp 只编 arm64（真机），缩短原生编译时间
             abiFilters += "arm64-v8a"
@@ -66,7 +66,8 @@ android {
 
     buildTypes {
         release {
-            isMinifyEnabled = false
+            isMinifyEnabled = true
+            isShrinkResources = true
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"

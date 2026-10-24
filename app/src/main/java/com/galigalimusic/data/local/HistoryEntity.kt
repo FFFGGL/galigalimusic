@@ -15,4 +15,6 @@ data class HistoryEntity(
     val coverUrl: String,
     val durationSec: Int,
     val lastPlayed: Long = System.currentTimeMillis(),
+    /** 累计收听秒数（播放统计用；v4→v5 迁移补默认值 0） */
+    val listenedSec: Long = 0L,
 )

@@ -47,6 +47,10 @@ class DownloadsViewModel(private val context: android.content.Context) : ViewMod
         Downloads.remove(context, key)
     }
 
+    fun removeBatch(context: Context, keys: Set<String>) {
+        keys.forEach { Downloads.remove(context, it) }
+    }
+
     fun retry(context: Context, download: Download) {
         viewModelScope.launch { Downloads.retry(context, download) }
     }
@@ -73,6 +77,10 @@ fun DownloadsScreen(
     val scope = rememberCoroutineScope()
     var filter by remember { mutableStateOf("全部") }
 
+    // 多选删除模式
+    var selectionMode by remember { mutableStateOf(false) }
+    var selected by remember { mutableStateOf(setOf<String>()) }
+
     // Android 13+ 通知权限：进入下载页时顺势请求（下载完成/失败需要通知）
     androidx.compose.runtime.LaunchedEffect(Unit) {
         val activity = context as? android.app.Activity ?: return@LaunchedEffect
@@ -98,14 +106,28 @@ fun DownloadsScreen(
             IconButton(onClick = onBack) { Text("←", style = MaterialTheme.typography.titleLarge) }
             Text("离线下载", style = MaterialTheme.typography.headlineSmall)
             Spacer(Modifier.weight(1f))
-            TextButton(onClick = {
-                androidx.media3.exoplayer.offline.DownloadService.sendPauseDownloads(
-                    context, DownloadService::class.java, false)
-            }) { Text("暂停") }
-            TextButton(onClick = {
-                androidx.media3.exoplayer.offline.DownloadService.sendResumeDownloads(
-                    context, DownloadService::class.java, false)
-            }) { Text("继续") }
+            if (selectionMode) {
+                TextButton(onClick = {
+                    selected = if (selected.size == visibleDownloads.size)
+                        emptySet() else visibleDownloads.map { it.request.id }.toSet()
+                }) { Text(if (selected.size == visibleDownloads.size) "全不选" else "全选") }
+                TextButton(onClick = {
+                    vm.removeBatch(context, selected)
+                    selected = emptySet()
+                    selectionMode = false
+                }, enabled = selected.isNotEmpty()) { Text("删除(${selected.size})") }
+                TextButton(onClick = { selectionMode = false; selected = emptySet() }) { Text("完成") }
+            } else {
+                TextButton(onClick = { selectionMode = true }, enabled = downloads.isNotEmpty()) { Text("多选") }
+                TextButton(onClick = {
+                    androidx.media3.exoplayer.offline.DownloadService.sendPauseDownloads(
+                        context, DownloadService::class.java, false)
+                }) { Text("暂停") }
+                TextButton(onClick = {
+                    androidx.media3.exoplayer.offline.DownloadService.sendResumeDownloads(
+                        context, DownloadService::class.java, false)
+                }) { Text("继续") }
+            }
         }
         Spacer(Modifier.height(10.dp))
         Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -144,18 +166,31 @@ fun DownloadsScreen(
                         else -> "未知"
                     }
                     Surface(
-                        color = MaterialTheme.colorScheme.surfaceContainer,
-                        contentColor = MaterialTheme.colorScheme.onSurface,
+                        color = if (d.request.id in selected) MaterialTheme.colorScheme.primaryContainer
+                        else MaterialTheme.colorScheme.surfaceContainer,
+                        contentColor = if (d.request.id in selected) MaterialTheme.colorScheme.onPrimaryContainer
+                        else MaterialTheme.colorScheme.onSurface,
                         shape = RoundedCornerShape(18.dp),
                         modifier = Modifier
                             .fillMaxWidth()
                             .then(
-                                if (d.state == Download.STATE_COMPLETED) Modifier.clickable {
-                                    onPlayDownload(bvid, cid, title, author, cover)
-                                } else Modifier
+                                when {
+                                    selectionMode -> Modifier.clickable {
+                                        val k = d.request.id
+                                        selected = if (k in selected) selected - k else selected + k
+                                    }
+                                    d.state == Download.STATE_COMPLETED -> Modifier.clickable {
+                                        onPlayDownload(bvid, cid, title, author, cover)
+                                    }
+                                    else -> Modifier
+                                }
                             ),
                     ) {
                         Row(modifier = Modifier.padding(10.dp), verticalAlignment = Alignment.CenterVertically) {
+                            if (selectionMode) {
+                                Checkbox(checked = d.request.id in selected, onCheckedChange = null)
+                                Spacer(Modifier.width(4.dp))
+                            }
                             if (cover.isNotEmpty()) {
                                 AsyncImage(
                                     model = cover, contentDescription = null,
@@ -188,29 +223,31 @@ fun DownloadsScreen(
                                     }
                                 }
                             }
-                            when (d.state) {
-                                Download.STATE_STOPPED -> IconButton(onClick = {
-                                    androidx.media3.exoplayer.offline.DownloadService.sendResumeDownloads(
-                                        context, DownloadService::class.java, false)
-                                }) {
-                                    Icon(Icons.Rounded.PlayArrow, contentDescription = "继续下载")
+                            if (!selectionMode) {
+                                when (d.state) {
+                                    Download.STATE_STOPPED -> IconButton(onClick = {
+                                        androidx.media3.exoplayer.offline.DownloadService.sendResumeDownloads(
+                                            context, DownloadService::class.java, false)
+                                    }) {
+                                        Icon(Icons.Rounded.PlayArrow, contentDescription = "继续下载")
+                                    }
+                                    Download.STATE_FAILED -> IconButton(onClick = {
+                                        vm.retry(context, d)
+                                    }) {
+                                        Icon(Icons.Rounded.Refresh, contentDescription = "重试下载")
+                                    }
+                                    Download.STATE_DOWNLOADING, Download.STATE_QUEUED -> IconButton(onClick = {
+                                        androidx.media3.exoplayer.offline.DownloadService.sendPauseDownloads(
+                                            context, DownloadService::class.java, false)
+                                    }) {
+                                        Icon(Icons.Rounded.Pause, contentDescription = "暂停下载")
+                                    }
+                                    else -> {}
                                 }
-                                Download.STATE_FAILED -> IconButton(onClick = {
-                                    vm.retry(context, d)
-                                }) {
-                                    Icon(Icons.Rounded.Refresh, contentDescription = "重试下载")
+                                IconButton(onClick = { vm.remove(context, key) }) {
+                                    Icon(Icons.Rounded.Close, contentDescription = "删除下载",
+                                        tint = MaterialTheme.colorScheme.onSurfaceVariant)
                                 }
-                                Download.STATE_DOWNLOADING, Download.STATE_QUEUED -> IconButton(onClick = {
-                                    androidx.media3.exoplayer.offline.DownloadService.sendPauseDownloads(
-                                        context, DownloadService::class.java, false)
-                                }) {
-                                    Icon(Icons.Rounded.Pause, contentDescription = "暂停下载")
-                                }
-                                else -> {}
-                            }
-                            IconButton(onClick = { vm.remove(context, key) }) {
-                                Icon(Icons.Rounded.Close, contentDescription = "删除下载",
-                                    tint = MaterialTheme.colorScheme.onSurfaceVariant)
                             }
                         }
                     }

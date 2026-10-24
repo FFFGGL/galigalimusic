@@ -24,6 +24,8 @@ class MusicRepository(private val db: AppDatabase) {
         durationSec: Int,
     ): ResolvedTrack {
         val url = BilibiliApi.getAudioUrl(bvid, cid)
+        // 保留累计收听时长：upsert 是 REPLACE 语义，直接覆盖会把统计清零
+        val prev = db.historyDao().getByKey(bvid, cid)
         db.historyDao().upsert(
             HistoryEntity(
                 bvid = bvid,
@@ -32,6 +34,7 @@ class MusicRepository(private val db: AppDatabase) {
                 author = author,
                 coverUrl = coverUrl,
                 durationSec = durationSec,
+                listenedSec = prev?.listenedSec ?: 0L,
             )
         )
         return ResolvedTrack(url, cid)
@@ -43,4 +46,12 @@ class MusicRepository(private val db: AppDatabase) {
     suspend fun upsertHistory(entity: HistoryEntity) = db.historyDao().upsert(entity)
 
     suspend fun clearHistory() = db.historyDao().clear()
+
+    /** 累加收听秒数（播放心跳定期刷入） */
+    suspend fun addListenTime(bvid: String, cid: Long, deltaSec: Long) =
+        db.historyDao().addListenTime(bvid, cid, deltaSec, System.currentTimeMillis())
+
+    suspend fun deleteHistoryOne(bvid: String, cid: Long) = db.historyDao().deleteOne(bvid, cid)
+
+    suspend fun getHistoryKey(bvid: String, cid: Long) = db.historyDao().getByKey(bvid, cid)
 }

@@ -5,6 +5,8 @@ import com.galigalimusic.data.local.PlaylistEntity
 import com.galigalimusic.data.local.PlaylistSongEntity
 import com.galigalimusic.data.remote.BilibiliApi
 import kotlinx.coroutines.flow.Flow
+import org.json.JSONArray
+import org.json.JSONObject
 import java.util.UUID
 
 class PlaylistRepository(private val db: AppDatabase) {
@@ -49,6 +51,85 @@ class PlaylistRepository(private val db: AppDatabase) {
 
     suspend fun removeSong(playlistId: String, bvid: String, cid: Long) =
         db.playlistSongDao().remove(playlistId, bvid, cid)
+
+    // ===== 备份导出 / 导入（换机、重装场景） =====
+
+    /** 导出全部歌单为 JSON 字符串 */
+    suspend fun exportJson(): String {
+        val root = JSONObject().apply {
+            put("app", "galigalimusic")
+            put("version", 1)
+            put("exportedAt", System.currentTimeMillis())
+        }
+        val arr = JSONArray()
+        db.playlistDao().getAll().forEach { pl ->
+            val songs = db.playlistSongDao().getSongs(pl.id)
+            val obj = JSONObject().apply {
+                put("title", pl.title)
+                put("favMediaId", pl.favMediaId ?: 0L)
+            }
+            val sa = JSONArray()
+            songs.forEach { s ->
+                sa.put(JSONObject().apply {
+                    put("bvid", s.bvid)
+                    put("cid", s.cid)
+                    put("title", s.title)
+                    put("author", s.author)
+                    put("coverUrl", s.coverUrl)
+                    put("durationSec", s.durationSec)
+                })
+            }
+            obj.put("songs", sa)
+            arr.put(obj)
+        }
+        root.put("playlists", arr)
+        return root.toString(2)
+    }
+
+    /**
+     * 从 JSON 导入歌单。同名歌单合并歌曲（按 bvid+cid 去重），否则新建。
+     * 返回 (新建歌单数, 新增歌曲数)。
+     */
+    suspend fun importJson(json: String): Pair<Int, Int> {
+        val root = runCatching { JSONObject(json) }.getOrNull()
+            ?: throw IllegalArgumentException("不是有效的备份文件")
+        val arr = root.optJSONArray("playlists") ?: return 0 to 0
+        var newPlaylists = 0
+        var newSongs = 0
+        for (i in 0 until arr.length()) {
+            val obj = arr.optJSONObject(i) ?: continue
+            val title = obj.optString("title").trim().ifEmpty { "导入的歌单" }
+            val songsArr = obj.optJSONArray("songs") ?: JSONArray()
+            val existing = db.playlistDao().getByTitle(title)
+            val id = existing?.id ?: run { newPlaylists++; create(title) }
+            val known = db.playlistSongDao().getSongs(id).map { it.bvid to it.cid }.toHashSet()
+            var pos = db.playlistSongDao().maxPosition(id)
+            for (j in 0 until songsArr.length()) {
+                val s = songsArr.optJSONObject(j) ?: continue
+                val bvid = s.optString("bvid").trim()
+                if (bvid.isEmpty()) continue
+                val cid = s.optLong("cid", 0L)
+                if (bvid to cid in known) continue
+                pos += 1
+                newSongs += 1
+                db.playlistSongDao().upsertAll(
+                    listOf(
+                        PlaylistSongEntity(
+                            playlistId = id,
+                            bvid = bvid,
+                            cid = cid,
+                            title = s.optString("title"),
+                            author = s.optString("author"),
+                            coverUrl = s.optString("coverUrl"),
+                            durationSec = s.optInt("durationSec"),
+                            position = pos,
+                        )
+                    )
+                )
+            }
+        }
+        return newPlaylists to newSongs
+    }
 
     /**
      * 导入 B 站收藏夹：新建歌单并拉取收藏夹内全部视频。
