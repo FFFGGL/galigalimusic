@@ -10,11 +10,9 @@ import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.widthIn
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Home
 import androidx.compose.material.icons.rounded.History
@@ -35,7 +33,6 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
-import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
@@ -209,16 +206,11 @@ private fun AppRoot(db: AppDatabase, repo: MusicRepository, playerVm: PlayerView
             }
         }
     ) { padding ->
-        // C8：平板/横屏内容限宽居中（720dp），避免超宽屏幕上列表/卡片被拉爆
-        Box(
+        NavHost(
+            navController = navController,
+            startDestination = "home",
             modifier = Modifier.fillMaxSize().padding(padding),
-            contentAlignment = Alignment.TopCenter,
         ) {
-            NavHost(
-                navController = navController,
-                startDestination = "home",
-                modifier = Modifier.fillMaxSize().widthIn(max = 720.dp),
-            ) {
             composable("home") { HomeScreen(playerVm, onNavigate = { navController.navigate(it) }, onToast = toast) }
             composable("playlists") {
                 PlaylistsScreen(
@@ -286,6 +278,5 @@ private fun AppRoot(db: AppDatabase, repo: MusicRepository, playerVm: PlayerView
                 )
             }
             }
-        }
     }
 }

@@ -24,8 +24,8 @@ android {
         applicationId = "com.galigalimusic.app"
         minSdk = 24
         targetSdk = 36
-        versionCode = 4
-        versionName = "1.3"
+        versionCode = 5
+        versionName = "1.3.1"
         ndk {
             // whisper.cpp 只编 arm64（真机），缩短原生编译时间
             abiFilters += "arm64-v8a"

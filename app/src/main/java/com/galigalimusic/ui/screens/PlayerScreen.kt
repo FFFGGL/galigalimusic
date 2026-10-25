@@ -93,8 +93,6 @@ fun PlayerScreen(
     val cs = MaterialTheme.colorScheme
     var showSleepTimer by remember { mutableStateOf(false) }
     var showQueue by remember { mutableStateOf(false) }
-    // C8：平板/横屏双栏布局（宽屏时封面在左、控制在右）
-    val wide = androidx.compose.ui.platform.LocalConfiguration.current.screenWidthDp >= 600
     var showSkipDialog by remember { mutableStateOf(false) }
     var showPages by remember { mutableStateOf(false) }
 
@@ -242,7 +240,7 @@ fun PlayerScreen(
                 return@Column
             }
 
-            // C8：宽屏（平板/横屏）双栏，窄屏单栏
+            // 单栏布局：封面 → 曲目信息/pills → 歌词 → 进度/控制 → 声音增强条
             val skipHead by playerVm.skipHeadSec.collectAsState()
             val skipTail by playerVm.skipTailSec.collectAsState()
             val pages by playerVm.pages.collectAsState()
@@ -250,58 +248,27 @@ fun PlayerScreen(
                 seeking?.let { f -> playerVm.seekTo((f * playback.durationMs).toLong()) }
                 seeking = null
             }
-            if (wide) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    PlayerMainContent(
-                        cur = cur,
-                        resolving = resolving,
-                        cs = cs,
-                        playerVm = playerVm,
-                        coverSize = 208.dp,
-                        onOpenSkipDialog = { showSkipDialog = true },
-                        onOpenPages = { showPages = true },
-                        modifier = Modifier.weight(1f),
-                    )
-                    PlayerBottomSection(
-                        playerVm = playerVm,
-                        playback = playback,
-                        cs = cs,
-                        seeking = seeking,
-                        onSeekingChange = { seeking = it },
-                        onSeekCommit = onSeekCommit,
-                        boostOn = boostOn,
-                        hasHistory = history.isNotEmpty(),
-                        onOpenLyrics = onOpenLyrics,
-                        lyricHeight = 170.dp,
-                        modifier = Modifier.weight(1f),
-                    )
-                }
-            } else {
-                PlayerMainContent(
-                    cur = cur,
-                    resolving = resolving,
-                    cs = cs,
-                    playerVm = playerVm,
-                    coverSize = 272.dp,
-                    onOpenSkipDialog = { showSkipDialog = true },
-                    onOpenPages = { showPages = true },
-                )
-                PlayerBottomSection(
-                    playerVm = playerVm,
-                    playback = playback,
-                    cs = cs,
-                    seeking = seeking,
-                    onSeekingChange = { seeking = it },
-                    onSeekCommit = onSeekCommit,
-                    boostOn = boostOn,
-                    hasHistory = history.isNotEmpty(),
-                    onOpenLyrics = onOpenLyrics,
-                    lyricHeight = 150.dp,
-                )
-            }
+            PlayerMainContent(
+                cur = cur,
+                resolving = resolving,
+                cs = cs,
+                playerVm = playerVm,
+                coverSize = 272.dp,
+                onOpenSkipDialog = { showSkipDialog = true },
+                onOpenPages = { showPages = true },
+            )
+            PlayerBottomSection(
+                playerVm = playerVm,
+                playback = playback,
+                cs = cs,
+                seeking = seeking,
+                onSeekingChange = { seeking = it },
+                onSeekCommit = onSeekCommit,
+                boostOn = boostOn,
+                hasHistory = history.isNotEmpty(),
+                onOpenLyrics = onOpenLyrics,
+                lyricHeight = 150.dp,
+            )
             // 弹窗：跳头尾 / 选集 / 队列 / 定时（布局无关，挂主作用域）
             if (showSkipDialog) {
                 SkipHeadTailDialog(
@@ -831,8 +798,7 @@ private fun LyricPanel(
 }
 
 /**
- * C8：播放页主体上半部分（封面 + 曲目信息 + 功能 pills）。
- * 从 PlayerScreen 提取，供窄屏单栏与宽屏双栏复用。
+ * 播放页主体上半部分（封面 + 曲目信息 + 功能 pills）。
  */
 @Composable
 private fun PlayerMainContent(
@@ -1030,8 +996,7 @@ private fun PlayerMainContent(
 }
 
 /**
- * C8：播放页主体下半部分（歌词 + 进度 + 控制行 + 声音增强条）。
- * 从 PlayerScreen 提取，供窄屏单栏与宽屏双栏复用。
+ * 播放页主体下半部分（歌词 + 进度 + 控制行 + 声音增强条）。
  */
 @Composable
 private fun PlayerBottomSection(
