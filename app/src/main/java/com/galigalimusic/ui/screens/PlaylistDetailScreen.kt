@@ -10,6 +10,7 @@ import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.CloudDownload
 import androidx.compose.material.icons.rounded.Delete
 import androidx.compose.material.icons.rounded.PlayArrow
+import androidx.compose.material.icons.rounded.PlaylistAdd
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -138,6 +139,22 @@ fun PlaylistDetailScreen(
                                 )
                             }
                             var downloading by remember { mutableStateOf(false) }
+                            // 稍后播放：加入队尾（skipNext / 播完自动续播时依次播放）
+                            IconButton(
+                                onClick = {
+                                    playerVm.enqueueLater(
+                                        item.bvid, item.cid, item.title,
+                                        item.author, item.coverUrl, item.durationSec,
+                                    )
+                                    onToast("已加入播放队列")
+                                },
+                            ) {
+                                Icon(
+                                    Icons.Rounded.PlaylistAdd,
+                                    contentDescription = "稍后播放",
+                                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
                             IconButton(
                                 onClick = {
                                     if (downloading) return@IconButton
@@ -148,6 +165,7 @@ fun PlaylistDetailScreen(
                                                 else com.galigalimusic.data.remote.BilibiliApi.getCid(item.bvid)
                                             val url = com.galigalimusic.data.remote.BilibiliApi.getAudioUrl(
                                                 item.bvid, realCid,
+                                                com.galigalimusic.data.remote.AudioQuality.effective(context),
                                             )
                                             com.galigalimusic.player.Downloads.start(
                                                 context, item.bvid, realCid, item.title,

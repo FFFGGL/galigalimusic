@@ -5,8 +5,9 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
-import androidx.compose.runtime.snapshotFlow
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.PlaylistAdd
 import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -17,6 +18,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import coil.compose.AsyncImage
@@ -30,6 +32,7 @@ fun SearchScreen(
     searchVm: SearchViewModel,
     playerVm: PlayerViewModel,
 ) {
+    val context = LocalContext.current
     val query by searchVm.query.collectAsState()
     val results by searchVm.results.collectAsState()
     val suggestions by searchVm.suggestions.collectAsState()
@@ -106,7 +109,19 @@ fun SearchScreen(
         } else {
             LazyColumn(state = listState, verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 items(results) { song ->
-                    SongRow(song, onClick = { playerVm.play(song) })
+                    SongRow(
+                        song,
+                        onClick = { playerVm.play(song) },
+                        onEnqueue = {
+                            playerVm.enqueueLater(
+                                song.bvid, song.cid, song.title,
+                                song.author, song.coverUrl, song.durationSec,
+                            )
+                            android.widget.Toast.makeText(
+                                context, "已加入播放队列", android.widget.Toast.LENGTH_SHORT,
+                            ).show()
+                        },
+                    )
                 }
                 if (loadingMore) {
                     item {
@@ -122,14 +137,14 @@ fun SearchScreen(
 }
 
 @Composable
-private fun SongRow(song: BilibiliApi.Song, onClick: () -> Unit) {
+private fun SongRow(song: BilibiliApi.Song, onClick: () -> Unit, onEnqueue: () -> Unit) {
     Surface(
         color = MaterialTheme.colorScheme.surfaceContainer,
         contentColor = MaterialTheme.colorScheme.onSurface,
         shape = RoundedCornerShape(20.dp),
         modifier = Modifier.fillMaxWidth().clickable(onClick = onClick),
     ) {
-        Row(modifier = Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
+        Row(modifier = Modifier.padding(start = 12.dp, end = 4.dp, top = 12.dp, bottom = 12.dp), verticalAlignment = Alignment.CenterVertically) {
             AsyncImage(
                 model = song.coverUrl,
                 contentDescription = null,
@@ -149,6 +164,13 @@ private fun SongRow(song: BilibiliApi.Song, onClick: () -> Unit) {
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     maxLines = 1,
+                )
+            }
+            IconButton(onClick = onEnqueue) {
+                Icon(
+                    Icons.Rounded.PlaylistAdd,
+                    contentDescription = "稍后播放",
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
         }

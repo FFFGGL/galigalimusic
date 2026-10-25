@@ -24,6 +24,8 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import coil.compose.AsyncImage
 import com.galigalimusic.data.local.AppDatabase
 import com.galigalimusic.data.local.HistoryEntity
+import com.galigalimusic.ui.formatDuration
+import com.galigalimusic.ui.formatMs
 import com.galigalimusic.viewmodel.HistoryViewModel
 import com.galigalimusic.viewmodel.PlayerViewModel
 
@@ -140,6 +142,26 @@ fun HistoryScreen(
                                         "听过 ${humanDuration(item.listenedSec)}",
                                         style = MaterialTheme.typography.labelSmall,
                                         color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        maxLines = 1,
+                                    )
+                                }
+                                // 续播进度：退出后从此处继续
+                                if (item.resumePositionMs > 3_000L && item.durationSec > 0) {
+                                    Spacer(Modifier.height(4.dp))
+                                    LinearProgressIndicator(
+                                        progress = {
+                                            (item.resumePositionMs.toFloat() /
+                                                (item.durationSec * 1000L)).coerceIn(0f, 1f)
+                                        },
+                                        modifier = Modifier.fillMaxWidth(0.55f).height(3.dp),
+                                        color = MaterialTheme.colorScheme.primary,
+                                        trackColor = MaterialTheme.colorScheme.surfaceContainerHighest,
+                                    )
+                                    Text(
+                                        "听到 ${formatMs(item.resumePositionMs)} / " +
+                                            formatDuration(item.durationSec),
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.primary,
                                         maxLines = 1,
                                     )
                                 }

@@ -6,9 +6,11 @@ import androidx.lifecycle.viewModelScope
 import com.galigalimusic.PlaybackConnection
 import com.galigalimusic.data.local.AppDatabase
 import com.galigalimusic.data.local.HistoryEntity
+import com.galigalimusic.data.local.QueueEntity
 import com.galigalimusic.data.remote.BiliSession
 import com.galigalimusic.data.remote.BilibiliApi
 import com.galigalimusic.data.repository.MusicRepository
+import com.galigalimusic.data.repository.QueueRepository
 import com.galigalimusic.whisper.WhisperLocal
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
@@ -21,6 +23,7 @@ import kotlinx.coroutines.launch
 
 class PlayerViewModel(
     private val repo: MusicRepository,
+    private val queueRepo: QueueRepository,
     db: AppDatabase,
     private val appContext: Context,
 ) : ViewModel() {
@@ -134,21 +137,115 @@ class PlayerViewModel(
         runCatching { PlaybackConnection.service.value?.setSpeed(next) }
     }
 
-    // ===== 定时关闭（睡前听书） =====
+    // ===== 定时关闭（睡前听书）：按分钟 / 按集数两种模式，互斥 =====
     @Volatile
     private var sleepEndAt = 0L
 
     private val _sleepRemainingSec = MutableStateFlow(-1L)
     val sleepRemainingSec: StateFlow<Long> = _sleepRemainingSec
 
+    /** 按集数定时：还剩几集（-1 = 未设置） */
+    private val _sleepTracksRemaining = MutableStateFlow(-1)
+    val sleepTracksRemaining: StateFlow<Int> = _sleepTracksRemaining
+    @Volatile
+    private var sleepTracksLeft = 0
+
     fun setSleepTimer(minutes: Int) {
+        sleepTracksLeft = 0
+        _sleepTracksRemaining.value = -1
         sleepEndAt = System.currentTimeMillis() + minutes * 60_000L
         _sleepRemainingSec.value = minutes * 60L
+    }
+
+    /** 按集数定时：放完 N 集后暂停（不自动进下一集） */
+    fun setSleepTimerTracks(tracks: Int) {
+        sleepEndAt = 0
+        _sleepRemainingSec.value = -1
+        sleepTracksLeft = tracks
+        _sleepTracksRemaining.value = tracks
     }
 
     fun clearSleepTimer() {
         sleepEndAt = 0
         _sleepRemainingSec.value = -1
+        sleepTracksLeft = 0
+        _sleepTracksRemaining.value = -1
+    }
+
+    // ===== 播放队列（稍后播放 / 下一首播放；skipNext 与播完续播优先弹队首） =====
+    val queue: StateFlow<List<QueueEntity>> = queueRepo.observeQueue()
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    /** 稍后播放：追加队尾 */
+    fun enqueueLater(
+        bvid: String,
+        cid: Long,
+        title: String,
+        author: String,
+        coverUrl: String,
+        durationSec: Int = 0,
+    ) {
+        viewModelScope.launch {
+            queueRepo.append(
+                QueueEntity(
+                    position = 0, bvid = bvid, cid = cid, title = title,
+                    author = author, coverUrl = coverUrl, durationSec = durationSec,
+                )
+            )
+        }
+    }
+
+    /** 下一首播放：插入队首 */
+    fun playNextInQueue(
+        bvid: String,
+        cid: Long,
+        title: String,
+        author: String,
+        coverUrl: String,
+        durationSec: Int = 0,
+    ) {
+        viewModelScope.launch {
+            queueRepo.prepend(
+                QueueEntity(
+                    position = 0, bvid = bvid, cid = cid, title = title,
+                    author = author, coverUrl = coverUrl, durationSec = durationSec,
+                )
+            )
+        }
+    }
+
+    /** 点队列项立即播放（从队列移除，成为当前曲目） */
+    fun playQueueItem(item: QueueEntity) {
+        viewModelScope.launch {
+            queueRepo.remove(item.id)
+            startPlayback(item.bvid, item.cid, item.title, item.author, item.coverUrl, item.durationSec)
+        }
+    }
+
+    fun removeFromQueue(id: Long) {
+        viewModelScope.launch { queueRepo.remove(id) }
+    }
+
+    fun moveInQueue(id: Long, delta: Int) {
+        viewModelScope.launch { queueRepo.move(id, delta) }
+    }
+
+    fun clearQueue() {
+        viewModelScope.launch { queueRepo.clear() }
+    }
+
+    /**
+     * 弹队首播放。队列非空返回 true（已接管切歌），空返回 false（调用方走原逻辑）。
+     */
+    private fun popQueueAndPlay(): Boolean {
+        val head = queue.value.firstOrNull() ?: return false
+        viewModelScope.launch {
+            runCatching { queueRepo.remove(head.id) }
+            startPlayback(
+                head.bvid, head.cid, head.title, head.author, head.coverUrl, head.durationSec,
+            )
+        }
+        return true
     }
 
     // ===== 播放失败自愈（URL 过期等 Source error → 重解析续播一次） =====
@@ -157,6 +254,9 @@ class PlayerViewModel(
     // ===== 收听计时（播放统计） =====
     private var listenAccumMs = 0L
     private var lastListenTickAt = System.currentTimeMillis()
+
+    // ===== 续播位置心跳 =====
+    private var resumeAccumMs = 0L
 
     // ===== AB 循环 =====
     private val _abPointA = MutableStateFlow<Long?>(null)
@@ -260,6 +360,7 @@ class PlayerViewModel(
                                             cur.bvid, cur.cid, cur.title, cur.author,
                                             cur.coverUrl,
                                             (_playback.value.durationMs / 1000).toInt(),
+                                            qn = effectiveAudioQn(),
                                         )
                                         svc.playUrl(resolved.url, cur.title, cur.author, cur.coverUrl, key)
                                         svc.seekTo(resumeAt)
@@ -277,23 +378,41 @@ class PlayerViewModel(
                     _playback.value = Playback(isPlaying = _isPlaying.value)
                 }
 
-                // 收听计时：播放中按真实时间累计，每 15 秒刷库一次（暂停不计，seek 跳跃不计）
+                // 收听计时 + 续播位置：播放中按真实时间累计。
+                // 收听每 15s 刷库；续播位置每 5s 刷库（杀进程最多丢 5 秒）
                 val nowMs = System.currentTimeMillis()
-                if (_isPlaying.value && _current.value != null) {
-                    listenAccumMs += (nowMs - lastListenTickAt).coerceIn(0L, 5_000L)
+                val playingNow = _isPlaying.value && _current.value != null
+                if (playingNow) {
+                    val delta = (nowMs - lastListenTickAt).coerceIn(0L, 5_000L)
+                    listenAccumMs += delta
+                    resumeAccumMs += delta
                 }
                 lastListenTickAt = nowMs
-                if (listenAccumMs >= 15_000) {
+                if (playingNow) {
                     val cur = _current.value
                     if (cur != null) {
-                        val sec = listenAccumMs / 1000
-                        listenAccumMs %= 1000
-                        viewModelScope.launch {
-                            runCatching { repo.addListenTime(cur.bvid, cur.cid, sec) }
+                        if (resumeAccumMs >= 5_000) {
+                            resumeAccumMs = 0
+                            val pos = _playback.value.positionMs
+                            if (pos > 0) {
+                                viewModelScope.launch {
+                                    runCatching { repo.saveResumePosition(cur.bvid, cur.cid, pos) }
+                                }
+                            }
+                        }
+                        if (listenAccumMs >= 15_000) {
+                            val sec = listenAccumMs / 1000
+                            listenAccumMs %= 1000
+                            viewModelScope.launch {
+                                runCatching { repo.addListenTime(cur.bvid, cur.cid, sec) }
+                            }
                         }
                     } else {
                         listenAccumMs = 0
+                        resumeAccumMs = 0
                     }
+                } else {
+                    resumeAccumMs = 0
                 }
 
                 // 定时关闭
@@ -385,6 +504,7 @@ class PlayerViewModel(
                     val resolved = repo.resolveAndRecord(
                         cur.bvid, cur.cid, composeHistoryTitle(cur.title, cur.pageLabel),
                         cur.author, cur.coverUrl, 0,
+                        qn = effectiveAudioQn(),
                     )
                     com.galigalimusic.whisper.WhisperLocal.downloadAudio(
                         resolved.url, audioFile
@@ -535,6 +655,49 @@ class PlayerViewModel(
         }
     }
 
+    // ===== B5 歌词手工校正 =====
+
+    /** 当前歌曲是否已有手工校正版（UI 显示「恢复原始」按钮） */
+    fun hasEditedLyrics(): Boolean {
+        val cur = _current.value ?: return false
+        return WhisperLocal.hasEditedCache(appContext, cur.bvid, cur.cid)
+    }
+
+    /**
+     * 保存对某一行的校正（文字 + 起止时间），整份写入 EDITED 缓存。
+     * 原自动来源缓存原样保留，随时可 [restoreOriginalLyrics] 还原。
+     */
+    fun saveLyricEdit(index: Int, text: String, startMs: Long, endMs: Long) {
+        val cur = _current.value ?: return
+        val lines = _lyrics.value.toMutableList()
+        if (index !in lines.indices) return
+        lines[index] = BilibiliApi.LrcLine(
+            startMs = startMs.coerceAtLeast(0),
+            endMs = endMs.coerceAtLeast(startMs + 1),
+            text = text.trim(),
+        )
+        WhisperLocal.saveLyricCache(
+            appContext, cur.bvid, cur.cid, WhisperLocal.LyricSource.EDITED, lines,
+        )
+        _lyrics.value = lines
+        _lyricsSource.value = WhisperLocal.LyricSource.EDITED
+        _lyricsState.value = LyricsState.LOADED
+    }
+
+    /** 恢复自动来源：删 EDITED 缓存后按优先级回落，都没有则重新联网拉 */
+    fun restoreOriginalLyrics() {
+        val cur = _current.value ?: return
+        WhisperLocal.clearEditedCache(appContext, cur.bvid, cur.cid)
+        val cached = WhisperLocal.loadPreferredLyricCache(appContext, cur.bvid, cur.cid)
+        if (cached != null) {
+            _lyrics.value = cached.first
+            _lyricsSource.value = cached.second
+            _lyricsState.value = LyricsState.LOADED
+        } else {
+            reloadLyricsFromNetwork(cur)
+        }
+    }
+
     /** 重新按网络优先级拉一次歌词（官方字幕 → LRCLIB），不阻塞播放 */
     private fun reloadLyricsFromNetwork(cur: Current) {
         viewModelScope.launch {
@@ -563,6 +726,24 @@ class PlayerViewModel(
 
     /** 播完一首：单曲循环由 ExoPlayer repeatMode 原生处理；其余按模式切集 */
     private fun onTrackEnded() {
+        // 自然播完：续播位置归零，下次从头开始
+        val ended = _current.value
+        if (ended != null) {
+            viewModelScope.launch {
+                runCatching { repo.clearResumePosition(ended.bvid, ended.cid) }
+            }
+        }
+        // 按集数定时：当前集放完后倒数，归零即停（不再自动下一集）
+        if (sleepTracksLeft > 0) {
+            sleepTracksLeft -= 1
+            if (sleepTracksLeft <= 0) {
+                sleepTracksLeft = 0
+                _sleepTracksRemaining.value = -1
+                runCatching { PlaybackConnection.service.value?.currentPlayer()?.pause() }
+                return
+            }
+            _sleepTracksRemaining.value = sleepTracksLeft
+        }
         when (_playMode.value) {
             PlayMode.REPEAT_ONE -> Unit
             PlayMode.SHUFFLE -> {
@@ -575,7 +756,7 @@ class PlayerViewModel(
                     history.value.randomOrNull()?.let { playFromHistory(it) }
                 }
             }
-            PlayMode.REPEAT_ALL -> skipPage(+1, wrap = true)
+            PlayMode.REPEAT_ALL -> if (!popQueueAndPlay()) skipPage(+1, wrap = true)
         }
     }
 
@@ -720,15 +901,19 @@ class PlayerViewModel(
             runCatching { service.setSpeed(_speed.value) }
             _isPlaying.value = true
             runCatching {
-                // 保留累计收听时长（REPLACE 语义会整行覆盖）
+                // 保留累计收听时长与续播位置（REPLACE 语义会整行覆盖）
                 val prev = runCatching { repo.getHistoryKey(pseudoBvid, 0L) }.getOrNull()
                 repo.upsertHistory(
                     HistoryEntity(
                         bvid = pseudoBvid, cid = 0L, title = title, author = author,
                         coverUrl = coverUrl ?: "", durationSec = 0,
                         listenedSec = prev?.listenedSec ?: 0L,
+                        resumePositionMs = prev?.resumePositionMs ?: 0L,
                     )
                 )
+                // 外部音源同样续播
+                val resumeMs = prev?.resumePositionMs ?: 0L
+                if (resumeMs > 3_000L) runCatching { service.seekTo(resumeMs) }
             }
             runCatching {
                 val wl = com.galigalimusic.whisper.WhisperLocal
@@ -810,7 +995,8 @@ class PlayerViewModel(
                     downloaded.request.uri.toString()
                 } else {
                     val resolved = repo.resolveAndRecord(
-                        bvid, cid, composeHistoryTitle(title, pageLabel), author, coverUrl, durationSec
+                        bvid, cid, composeHistoryTitle(title, pageLabel), author, coverUrl, durationSec,
+                        qn = effectiveAudioQn(),
                     )
                     resolved.url
                 }
@@ -818,8 +1004,15 @@ class PlayerViewModel(
                 service.playUrl(playUrl, title, author, coverUrl, cacheKey)
                 // 恢复用户倍速（ExoPlayer 换曲会保留参数，但进程重启后需重设）
                 runCatching { service.setSpeed(_speed.value) }
-                // 跳过片头
-                if (headSkipSec > 0) runCatching { service.seekTo(headSkipSec * 1000L) }
+                // 续播：有进度就从上次位置继续（优先于片头跳过）；没有才跳片头
+                val resumeMs = runCatching {
+                    repo.getHistoryKey(bvid, cid)?.resumePositionMs ?: 0L
+                }.getOrDefault(0L)
+                if (resumeMs > 3_000L) {
+                    runCatching { service.seekTo(resumeMs) }
+                } else if (headSkipSec > 0) {
+                    runCatching { service.seekTo(headSkipSec * 1000L) }
+                }
                 // 切歌清空 AB 循环（AB 是曲目级状态）
                 _abPointA.value = null
                 _abPointB.value = null
@@ -873,6 +1066,8 @@ class PlayerViewModel(
 
     /** 下一首/上一首：多P 视频 = 下一集/上一集（循环）；单P = 历史顺序导航 */
     fun skipNext() {
+        // 队列优先：有待播队列时先弹队首
+        if (popQueueAndPlay()) return
         if (_pages.value.size > 1) skipPage(+1, wrap = true) else historySkip(+1)
     }
 
@@ -930,6 +1125,7 @@ class PlayerViewModel(
                 val resolved = repo.resolveAndRecord(
                     cur.bvid, cur.cid, composeHistoryTitle(cur.title, cur.pageLabel),
                     cur.author, cur.coverUrl, (_playback.value.durationMs / 1000).toInt(),
+                    qn = effectiveAudioQn(),
                 )
                 com.galigalimusic.player.Downloads.start(
                     appContext, cur.bvid, cur.cid, cur.title, cur.author, cur.coverUrl, resolved.url,
@@ -951,6 +1147,50 @@ class PlayerViewModel(
 
     fun isVolumeBoostOn(): Boolean = _volumeBoost.value
 
+    // ===== 歌词字号（全局，持久化；歌词页/播放页预览共用） =====
+    private val _lyricFontScale = MutableStateFlow(prefs.getFloat("lyric_font_scale", 1.0f))
+    val lyricFontScale: StateFlow<Float> = _lyricFontScale
+
+    /** 循环切换字号：0.85(小) → 1.0(标准) → 1.2(大) → 1.45(特大) → 回小 */
+    fun cycleLyricFontScale() {
+        val options = floatArrayOf(0.85f, 1.0f, 1.2f, 1.45f)
+        val next = options.firstOrNull { it > _lyricFontScale.value + 0.01f } ?: options.first()
+        _lyricFontScale.value = next
+        prefs.edit().putFloat("lyric_font_scale", next).apply()
+    }
+
+    fun lyricFontScaleLabel(): String = when (_lyricFontScale.value) {
+        in 0f..0.9f -> "小"
+        in 0.9f..1.05f -> "标准"
+        in 1.05f..1.3f -> "大"
+        else -> "特大"
+    }
+
+    // ===== 播放音质（全局，持久化；蜂窝下按「仅 Wi-Fi 高音质」降档） =====
+    private val _audioQuality = MutableStateFlow(
+        com.galigalimusic.data.remote.AudioQuality.selected(appContext)
+    )
+    val audioQuality: StateFlow<Int> = _audioQuality
+
+    private val _wifiOnlyHighQuality = MutableStateFlow(
+        com.galigalimusic.data.remote.AudioQuality.wifiOnlyHigh(appContext)
+    )
+    val wifiOnlyHighQuality: StateFlow<Boolean> = _wifiOnlyHighQuality
+
+    fun setAudioQuality(qn: Int) {
+        com.galigalimusic.data.remote.AudioQuality.setSelected(appContext, qn)
+        _audioQuality.value = qn
+    }
+
+    fun setWifiOnlyHighQuality(on: Boolean) {
+        com.galigalimusic.data.remote.AudioQuality.setWifiOnlyHigh(appContext, on)
+        _wifiOnlyHighQuality.value = on
+    }
+
+    /** 当前网络下的生效档位 */
+    fun effectiveAudioQn(): Int =
+        com.galigalimusic.data.remote.AudioQuality.effective(appContext)
+
     /** 播放页面打开时与服务对齐一次（服务可能比 VM 先/后就绪） */
     fun syncState() {
         runCatching {
@@ -960,6 +1200,76 @@ class PlayerViewModel(
         applyPlayMode(_playMode.value)
         runCatching {
             PlaybackConnection.service.value?.setGain(if (_volumeBoost.value) 1.6f else 1.0f)
+        }
+    }
+
+    // ===== B6 追更订阅 =====
+
+    private val subRepo = com.galigalimusic.data.repository.SubscriptionRepository(db)
+
+    /** 已订阅的 bvid 集合（播放页追更按钮高亮） */
+    val subscribedBvids: StateFlow<Set<String>> = subRepo.subscribedBvids
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptySet())
+
+    private val _subscribeMsg = MutableStateFlow<String?>(null)
+    val subscribeMsg: StateFlow<String?> = _subscribeMsg
+
+    fun consumeSubscribeMsg() { _subscribeMsg.value = null }
+
+    /** 播放页追更按钮：对当前合集订阅/退订（拉最新分P数作基线） */
+    fun toggleSubscribeCurrent() {
+        val cur = _current.value ?: return
+        if (cur.bvid.isEmpty()) return
+        viewModelScope.launch {
+            val existing = subscribedBvids.value.contains(cur.bvid)
+            if (existing) {
+                subRepo.unsubscribe(cur.bvid)
+                _subscribeMsg.value = "已取消追更"
+                return@launch
+            }
+            _subscribeMsg.value = "正在获取合集信息…"
+            val meta = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                runCatching { BilibiliApi.getVideoMeta(cur.bvid) }.getOrNull()
+            }
+            if (meta == null || meta.pageCount <= 0) {
+                _subscribeMsg.value = "获取合集信息失败，稍后重试"
+                return@launch
+            }
+            subRepo.subscribe(
+                bvid = meta.bvid,
+                title = meta.title.ifBlank { cur.title },
+                author = meta.author.ifBlank { cur.author },
+                coverUrl = meta.coverUrl.ifBlank { cur.coverUrl },
+                pageCount = meta.pageCount,
+            )
+            _subscribeMsg.value = "已追更（当前 ${meta.pageCount} 集）"
+        }
+    }
+
+    /** 从追更列表播放：有历史则从最近听的一集续播，否则从第 1 集开始 */
+    fun playSubscription(bvid: String) {
+        viewModelScope.launch {
+            val hist = runCatching { repo.getHistoryLatestForBvid(bvid) }.getOrNull()
+            if (hist != null) {
+                playFromHistory(hist)
+                return@launch
+            }
+            val pages = runCatching { BilibiliApi.getVideoPages(bvid) }.getOrNull().orEmpty()
+            if (pages.isEmpty()) {
+                _errorMessage.value = "获取合集信息失败，请稍后重试"
+                return@launch
+            }
+            val first = pages.first()
+            val meta = runCatching { BilibiliApi.getVideoMeta(bvid) }.getOrNull()
+            startPlayback(
+                bvid = bvid,
+                cid = first.cid,
+                title = meta?.title?.ifBlank { null } ?: bvid,
+                author = meta?.author.orEmpty(),
+                coverUrl = meta?.coverUrl.orEmpty(),
+                durationSec = 0,
+                pageLabel = if (pages.size > 1) "P${first.page} ${first.part}".trim() else "",
+            )
         }
     }
 }

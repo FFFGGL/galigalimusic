@@ -134,6 +134,34 @@ object BiliSession {
         }
     }
 
+    /**
+     * 强制刷新 buvid3/buvid4（C9 风控自愈：412 拦截后调用）。
+     * 与 [warmUp] 的区别：warmUp 已有则跳过，这里总是重新领取。
+     * @return true = 刷新成功
+     */
+    suspend fun refreshBuvid(): Boolean = withContext(Dispatchers.IO) {
+        runCatching {
+            // 主站 Set-Cookie 会由 jar 自动落盘新的 buvid3
+            client.newCall(
+                Request.Builder().url("https://www.bilibili.com/").header("User-Agent", UA).build()
+            ).execute().use { it.body?.string() }
+            client.newCall(
+                Request.Builder()
+                    .url("https://api.bilibili.com/x/frontend/finger/spi")
+                    .header("User-Agent", UA)
+                    .build()
+            ).execute().use { resp ->
+                val data = org.json.JSONObject(resp.body?.string().orEmpty()).optJSONObject("data")
+                    ?: return@use
+                edit { e ->
+                    e.putString("buvid3", data.optString("b_3"))
+                    e.putString("buvid4", data.optString("b_4"))
+                }
+            }
+            true
+        }.getOrDefault(false)
+    }
+
     /** 给 Media3 原生 DataSource 使用的 Cookie 头（OkHttp CookieJar 不会自动传过去）。 */
     fun cookieHeader(): String {
         val p = prefs ?: return ""

@@ -33,6 +33,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -42,8 +43,13 @@ import com.galigalimusic.player.MediaCache
 import com.galigalimusic.ui.theme.ThemeEngine
 
 @Composable
-fun SettingsScreen() {
+fun SettingsScreen(db: com.galigalimusic.data.local.AppDatabase) {
     val dynamicColor by ThemeEngine.dynamicColor.collectAsState()
+    // C10：AMOLED 纯黑状态
+    val amoledManual by ThemeEngine.amoledManual.collectAsState()
+    val amoledSchedOn by ThemeEngine.amoledSchedOn.collectAsState()
+    val amoledSchedStart by ThemeEngine.amoledSchedStart.collectAsState()
+    val amoledSchedEnd by ThemeEngine.amoledSchedEnd.collectAsState()
     val mid by com.galigalimusic.data.remote.BiliSession.mid.collectAsState()
     var showQrLogin by remember { mutableStateOf(false) }
     var showImport by remember { mutableStateOf(false) }
@@ -59,9 +65,11 @@ fun SettingsScreen() {
     val alistUser = remember { mutableStateOf(ExternalSources.getUser(context)) }
     val alistPass = remember { mutableStateOf(ExternalSources.getPass(context)) }
 
-    // 音量增益与播放页共用同一状态（PlayerViewModel.volumeBoost，持久化在 playback prefs）
-    val playerVm = com.galigalimusic.ui.components.LocalPlayerViewModel.current
-    val louder by playerVm.volumeBoost.collectAsState()
+        // 音量增益与播放页共用同一状态（PlayerViewModel.volumeBoost，持久化在 playback prefs）
+        val playerVm = com.galigalimusic.ui.components.LocalPlayerViewModel.current
+        val louder by playerVm.volumeBoost.collectAsState()
+        val audioQuality by playerVm.audioQuality.collectAsState()
+        val wifiOnlyHigh by playerVm.wifiOnlyHighQuality.collectAsState()
 
     // 本地识别模型 / 语言（持久化在 whisper_prefs）
     var whisperModel by remember { mutableStateOf(com.galigalimusic.whisper.WhisperLocal.currentModel(context)) }
@@ -141,8 +149,66 @@ fun SettingsScreen() {
                     title = "封面动态取色",
                     subtitle = "整套界面强调色随播放封面变化（方案 B 核心）",
                     checked = dynamicColor,
-                    onChecked = { ThemeEngine.dynamicColor.value = it },
+                    onChecked = { ThemeEngine.setDynamicColor(it) },
                 )
+                // C10：AMOLED 纯黑 + 定时启用
+                SettingSwitch(
+                    title = "AMOLED 纯黑",
+                    subtitle = "背景与面板纯黑，OLED 屏更省电、对比更强",
+                    checked = amoledManual,
+                    onChecked = { ThemeEngine.setAmoledManual(it) },
+                )
+                SettingSwitch(
+                    title = "定时启用纯黑",
+                    subtitle = if (amoledSchedOn)
+                        "每天 %02d:00 – %02d:00 自动切换".format(amoledSchedStart, amoledSchedEnd)
+                    else "关闭状态下仅手动开关生效",
+                    checked = amoledSchedOn,
+                    onChecked = {
+                        ThemeEngine.setAmoledSchedule(it, amoledSchedStart, amoledSchedEnd)
+                    },
+                )
+                if (amoledSchedOn) {
+                    // 起止小时调整（跨零点，如 22→6 表示夜间时段）
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 16.dp, vertical = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text("开始", style = MaterialTheme.typography.bodyMedium,
+                            modifier = Modifier.width(40.dp))
+                        TextButton(onClick = {
+                            ThemeEngine.setAmoledSchedule(true, (amoledSchedStart + 23) % 24, amoledSchedEnd)
+                        }) { Text("−") }
+                        Text(
+                            "%02d:00".format(amoledSchedStart),
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.width(56.dp),
+                            textAlign = TextAlign.Center,
+                        )
+                        TextButton(onClick = {
+                            ThemeEngine.setAmoledSchedule(true, (amoledSchedStart + 1) % 24, amoledSchedEnd)
+                        }) { Text("+") }
+                        Spacer(Modifier.width(16.dp))
+                        Text("结束", style = MaterialTheme.typography.bodyMedium,
+                            modifier = Modifier.width(40.dp))
+                        TextButton(onClick = {
+                            ThemeEngine.setAmoledSchedule(true, amoledSchedStart, (amoledSchedEnd + 23) % 24)
+                        }) { Text("−") }
+                        Text(
+                            "%02d:00".format(amoledSchedEnd),
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.width(56.dp),
+                            textAlign = TextAlign.Center,
+                        )
+                        TextButton(onClick = {
+                            ThemeEngine.setAmoledSchedule(true, amoledSchedStart, (amoledSchedEnd + 1) % 24)
+                        }) { Text("+") }
+                    }
+                }
             }
         }
         Spacer(Modifier.height(16.dp))
@@ -163,6 +229,203 @@ fun SettingsScreen() {
                     checked = louder,
                     onChecked = { playerVm.setVolumeBoost(it) },
                 )
+            }
+        }
+        Spacer(Modifier.height(16.dp))
+
+        // 播放音质组
+        Text("播放音质", style = MaterialTheme.typography.titleSmall,
+            color = MaterialTheme.colorScheme.primary)
+        Spacer(Modifier.height(6.dp))
+        Surface(
+            color = MaterialTheme.colorScheme.surfaceContainer,
+            shape = RoundedCornerShape(22.dp),
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    com.galigalimusic.data.remote.AudioQuality.OPTIONS.forEach { qn ->
+                        val active = audioQuality == qn
+                        FilledTonalButton(
+                            onClick = { playerVm.setAudioQuality(qn) },
+                            colors = ButtonDefaults.filledTonalButtonColors(
+                                containerColor = if (active) MaterialTheme.colorScheme.primary
+                                else MaterialTheme.colorScheme.surfaceContainerHigh,
+                                contentColor = if (active) MaterialTheme.colorScheme.onPrimary
+                                else MaterialTheme.colorScheme.onSurface,
+                            ),
+                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                        ) {
+                            Text(
+                                com.galigalimusic.data.remote.AudioQuality.label(qn),
+                                style = MaterialTheme.typography.labelSmall,
+                            )
+                        }
+                    }
+                }
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) {
+                        Text("仅 Wi-Fi 用高音质", style = MaterialTheme.typography.bodyMedium)
+                        Text(
+                            "蜂窝网络下自动降到中档（132K），出门听书省流量",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    Spacer(Modifier.width(8.dp))
+                    Switch(
+                        checked = wifiOnlyHigh,
+                        onCheckedChange = { playerVm.setWifiOnlyHighQuality(it) },
+                    )
+                }
+                Text(
+                    "对在线播放与离线下载同时生效；已下载的文件不受影响",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+        Spacer(Modifier.height(16.dp))
+
+        // C11：WebDAV 云端备份组
+        Text("云端备份（WebDAV）", style = MaterialTheme.typography.titleSmall,
+            color = MaterialTheme.colorScheme.primary)
+        Spacer(Modifier.height(6.dp))
+        Surface(
+            color = MaterialTheme.colorScheme.surfaceContainer,
+            shape = RoundedCornerShape(22.dp),
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text(
+                    "把歌单备份到 Nextcloud / 坚果云等 WebDAV 网盘，换机后一键恢复",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                var davUrl by remember { mutableStateOf(com.galigalimusic.data.remote.WebDavPrefs.url(context)) }
+                var davUser by remember { mutableStateOf(com.galigalimusic.data.remote.WebDavPrefs.user(context)) }
+                var davPass by remember { mutableStateOf(com.galigalimusic.data.remote.WebDavPrefs.pass(context)) }
+                var davBusy by remember { mutableStateOf(false) }
+                var davMsg by remember { mutableStateOf("") }
+                OutlinedTextField(
+                    value = davUrl,
+                    onValueChange = { davUrl = it },
+                    label = { Text("服务器地址") },
+                    placeholder = { Text("https://dav.jianguoyun.com/dav/") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedTextField(
+                        value = davUser,
+                        onValueChange = { davUser = it },
+                        label = { Text("账号") },
+                        singleLine = true,
+                        modifier = Modifier.weight(1f),
+                    )
+                    OutlinedTextField(
+                        value = davPass,
+                        onValueChange = { davPass = it },
+                        label = { Text("密码/应用密码") },
+                        singleLine = true,
+                        modifier = Modifier.weight(1f),
+                    )
+                }
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    FilledTonalButton(
+                        enabled = !davBusy && davUrl.isNotBlank() && davUser.isNotBlank() && davPass.isNotBlank(),
+                        onClick = {
+                            com.galigalimusic.data.remote.WebDavPrefs.save(context, davUrl, davUser, davPass)
+                            davBusy = true
+                            davMsg = "正在测试连接…"
+                            scope.launch {
+                                val r = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                                    com.galigalimusic.data.remote.WebDavClient.test(davUrl, davUser, davPass)
+                                }
+                                davBusy = false
+                                davMsg = r.fold(
+                                    onSuccess = { "✓ $it" },
+                                    onFailure = { "✗ ${it.message ?: "连接失败"}" },
+                                )
+                            }
+                        },
+                    ) { Text("保存并测试") }
+                    OutlinedButton(
+                        enabled = !davBusy && com.galigalimusic.data.remote.WebDavPrefs.isConfigured(context),
+                        onClick = {
+                            davBusy = true
+                            davMsg = "正在上传备份…"
+                            scope.launch {
+                                val json = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                                    com.galigalimusic.data.repository.PlaylistRepository(db).exportJson()
+                                }
+                                val r = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                                    com.galigalimusic.data.remote.WebDavClient.upload(
+                                        com.galigalimusic.data.remote.WebDavPrefs.url(context),
+                                        com.galigalimusic.data.remote.WebDavPrefs.user(context),
+                                        com.galigalimusic.data.remote.WebDavPrefs.pass(context),
+                                        com.galigalimusic.data.remote.WebDavClient.BACKUP_FILE,
+                                        json,
+                                    )
+                                }
+                                davBusy = false
+                                davMsg = if (r.isSuccess) "✓ 备份已上传" else "✗ ${r.exceptionOrNull()?.message ?: "上传失败"}"
+                            }
+                        },
+                    ) { Text("立即备份") }
+                    OutlinedButton(
+                        enabled = !davBusy && com.galigalimusic.data.remote.WebDavPrefs.isConfigured(context),
+                        onClick = {
+                            davBusy = true
+                            davMsg = "正在下载并恢复…"
+                            scope.launch {
+                                val dl = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                                    com.galigalimusic.data.remote.WebDavClient.download(
+                                        com.galigalimusic.data.remote.WebDavPrefs.url(context),
+                                        com.galigalimusic.data.remote.WebDavPrefs.user(context),
+                                        com.galigalimusic.data.remote.WebDavPrefs.pass(context),
+                                    )
+                                }
+                                davMsg = dl.fold(
+                                    onSuccess = { json ->
+                                        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                                            com.galigalimusic.data.repository.PlaylistRepository(db).importJson(json)
+                                        }.let { (pl, songs) ->
+                                            "✓ 恢复完成：$pl 个歌单 / $songs 首"
+                                        }
+                                    },
+                                    onFailure = { "✗ ${it.message ?: "下载失败"}" },
+                                )
+                                davBusy = false
+                            }
+                        },
+                    ) { Text("从云端恢复") }
+                }
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) {
+                        Text("每周自动备份", style = MaterialTheme.typography.bodyMedium)
+                        Text(
+                            "仅在连接 Wi-Fi/网络时执行，失败自动重试",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    Spacer(Modifier.width(8.dp))
+                    Switch(
+                        checked = com.galigalimusic.data.remote.WebDavPrefs.autoBackup(context),
+                        onCheckedChange = { on ->
+                            com.galigalimusic.data.remote.WebDavPrefs.setAutoBackup(context, on)
+                            if (on) com.galigalimusic.work.BackupWorker.schedule(context)
+                        },
+                    )
+                }
+                if (davMsg.isNotEmpty()) {
+                    Text(
+                        davMsg,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.primary,
+                    )
+                }
             }
         }
         Spacer(Modifier.height(16.dp))

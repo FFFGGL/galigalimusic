@@ -17,4 +17,6 @@ data class HistoryEntity(
     val lastPlayed: Long = System.currentTimeMillis(),
     /** 累计收听秒数（播放统计用；v4→v5 迁移补默认值 0） */
     val listenedSec: Long = 0L,
+    /** 续播位置（毫秒）：退出/杀进程后从此处继续；播完自然归零（v5→v6 迁移补 0） */
+    val resumePositionMs: Long = 0L,
 )

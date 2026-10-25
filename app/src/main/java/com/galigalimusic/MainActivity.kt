@@ -9,13 +9,17 @@ import android.os.IBinder
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Home
 import androidx.compose.material.icons.rounded.History
 import androidx.compose.material.icons.automirrored.rounded.QueueMusic
+import androidx.compose.material.icons.rounded.NotificationsActive
 import androidx.compose.material.icons.rounded.Search
 import androidx.compose.material.icons.rounded.Settings
 import androidx.compose.material3.Icon
@@ -31,8 +35,10 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.lifecycle.lifecycleScope
 import androidx.navigation.compose.NavHost
@@ -41,6 +47,7 @@ import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import com.galigalimusic.data.local.AppDatabase
 import com.galigalimusic.data.repository.MusicRepository
+import com.galigalimusic.data.repository.SubscriptionRepository
 import com.galigalimusic.player.MusicService
 import com.galigalimusic.ui.components.MiniPlayer
 import com.galigalimusic.ui.screens.DownloadsScreen
@@ -54,12 +61,15 @@ import com.galigalimusic.ui.screens.PlaylistsScreen
 import com.galigalimusic.ui.screens.PlayerScreen
 import com.galigalimusic.ui.screens.SearchScreen
 import com.galigalimusic.ui.screens.SettingsScreen
+import com.galigalimusic.ui.screens.SubscriptionsScreen
 import com.galigalimusic.ui.theme.CoverAccent
 import com.galigalimusic.ui.theme.GaligaliMusicTheme
 import com.galigalimusic.ui.theme.ThemeEngine
 import com.galigalimusic.viewmodel.HistoryViewModel
 import com.galigalimusic.viewmodel.PlayerViewModel
 import com.galigalimusic.viewmodel.SearchViewModel
+import com.galigalimusic.viewmodel.SubscriptionViewModel
+import com.galigalimusic.work.UpdateCheckWorker
 import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
@@ -73,11 +83,20 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         // Cookie 会话先行初始化（BilibiliApi/WbiSigner 的请求都要带 Cookie）
         com.galigalimusic.data.remote.BiliSession.init(applicationContext)
+        // 主题设置（动态取色/AMOLED 纯黑/定时）加载持久化值
+        com.galigalimusic.ui.theme.ThemeEngine.init(applicationContext)
         lifecycleScope.launch {
             com.galigalimusic.data.remote.BiliSession.warmUp()
         }
         db = AppDatabase.getInstance(applicationContext)
         repo = MusicRepository(db)
+
+        // 追更提醒：注册周期检查（首次安装即注册，无订阅时自动空转）
+        UpdateCheckWorker.schedule(applicationContext)
+        // WebDAV 自动备份：仅在用户开启时注册（Worker 内还有一道守卫）
+        if (com.galigalimusic.data.remote.WebDavPrefs.autoBackup(applicationContext)) {
+            com.galigalimusic.work.BackupWorker.schedule(applicationContext)
+        }
 
         // 绑定前台播放服务（自定义 action，避免与系统媒体会话绑定冲突）。
         // 注意不能用 startForegroundService()：MediaSessionService 只在真正开始播放时
@@ -102,7 +121,12 @@ class MainActivity : ComponentActivity() {
             androidx.lifecycle.ViewModelProvider.Factory {
             @Suppress("UNCHECKED_CAST")
             override fun <T : androidx.lifecycle.ViewModel> create(modelClass: Class<T>): T =
-                PlayerViewModel(repo, db, applicationContext) as T
+                PlayerViewModel(
+                    repo,
+                    com.galigalimusic.data.repository.QueueRepository(db),
+                    db,
+                    applicationContext,
+                ) as T
         })[PlayerViewModel::class.java]
 
         setContent {
@@ -140,6 +164,7 @@ private fun AppRoot(db: AppDatabase, repo: MusicRepository, playerVm: PlayerView
         NavItem("playlists", "歌单", Icons.AutoMirrored.Rounded.QueueMusic),
         NavItem("search", "搜索", Icons.Rounded.Search),
         NavItem("history", "历史", Icons.Rounded.History),
+        NavItem("subscriptions", "追更", Icons.Rounded.NotificationsActive),
         NavItem("settings", "设置", Icons.Rounded.Settings),
     )
     val backStackEntry by navController.currentBackStackEntryAsState()
@@ -184,11 +209,16 @@ private fun AppRoot(db: AppDatabase, repo: MusicRepository, playerVm: PlayerView
             }
         }
     ) { padding ->
-        NavHost(
-            navController = navController,
-            startDestination = "home",
+        // C8：平板/横屏内容限宽居中（720dp），避免超宽屏幕上列表/卡片被拉爆
+        Box(
             modifier = Modifier.fillMaxSize().padding(padding),
+            contentAlignment = Alignment.TopCenter,
         ) {
+            NavHost(
+                navController = navController,
+                startDestination = "home",
+                modifier = Modifier.fillMaxSize().widthIn(max = 720.dp),
+            ) {
             composable("home") { HomeScreen(playerVm, onNavigate = { navController.navigate(it) }, onToast = toast) }
             composable("playlists") {
                 PlaylistsScreen(
@@ -209,7 +239,22 @@ private fun AppRoot(db: AppDatabase, repo: MusicRepository, playerVm: PlayerView
                     onOpenDownloads = { navController.navigate("downloads") { launchSingleTop = true } },
                 )
             }
-            composable("settings") { SettingsScreen() }
+            composable("subscriptions") {
+                val subVm: SubscriptionViewModel = viewModel(
+                    factory = SubscriptionViewModel.Factory(
+                        SubscriptionRepository(db)
+                    )
+                )
+                SubscriptionsScreen(
+                    vm = subVm,
+                    onBack = { navController.popBackStack() },
+                    onPlay = { sub ->
+                        playerVm.playSubscription(sub.bvid)
+                        navController.navigate("player") { launchSingleTop = true }
+                    },
+                )
+            }
+            composable("settings") { SettingsScreen(db) }
             composable("player") {
                 PlayerScreen(
                     playerVm,
@@ -239,6 +284,7 @@ private fun AppRoot(db: AppDatabase, repo: MusicRepository, playerVm: PlayerView
                         navController.navigate("settings") { launchSingleTop = true }
                     },
                 )
+            }
             }
         }
     }

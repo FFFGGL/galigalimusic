@@ -175,4 +175,84 @@ class PlaylistRepository(private val db: AppDatabase) {
         db.playlistDao().markFavSynced(id, mediaId, System.currentTimeMillis())
         return id to fresh.size
     }
+
+    // ===== B7 外部歌单导入（m3u / 歌单名清单） =====
+
+    /**
+     * 导入外部条目到歌单（同名则合并，按 bvid+cid 去重）。
+     *
+     * · bvid 条目：拉 view 接口补 cid/标题/封面（cid=0 无法播放，必须补）
+     * · extUri 条目：本地文件，以 ext: 前缀入库（播放器免解析直连）
+     * · 纯标题条目（歌单名清单）：先搜索取首个结果，再按上两条处理
+     *
+     * @return (新增歌曲数, 未匹配数)
+     */
+    suspend fun importExternal(
+        playlistTitle: String,
+        entries: List<ExternalEntry>,
+        onProgress: (done: Int, total: Int) -> Unit = { _, _ -> },
+    ): Pair<Int, Int> {
+        val title = playlistTitle.trim().ifEmpty { "导入的歌单" }
+        val existing = db.playlistDao().getByTitle(title)
+        val id = existing?.id ?: create(title)
+        val known = db.playlistSongDao().getSongs(id)
+            .map { it.bvid to it.cid }.toHashSet()
+        var pos = db.playlistSongDao().maxPosition(id)
+        var added = 0
+        var missed = 0
+        entries.forEachIndexed { i, entry ->
+            onProgress(i, entries.size)
+            // 统一解析为 (条目, cid)；cid 仅 B 站条目需要
+            val resolved: Pair<ExternalEntry, Long>? = when {
+                // 本地文件：直接用（cid 无意义）
+                entry.extUri.isNotEmpty() -> entry to 0L
+                // 有 BV 号：补全元信息 + 首个分P cid（cid=0 无法播放，必须补）
+                entry.bvid.isNotEmpty() -> {
+                    val meta = runCatching { BilibiliApi.getVideoMeta(entry.bvid) }.getOrNull()
+                    if (meta == null) null else entry.copy(
+                        title = meta.title.ifBlank { entry.title }.ifBlank { meta.bvid },
+                        author = meta.author.ifBlank { entry.author },
+                    ) to meta.firstCid
+                }
+                // 歌单名清单：搜索取第一个结果，再补 cid
+                else -> {
+                    val keyword = listOf(entry.title, entry.author)
+                        .filter { it.isNotBlank() }.joinToString(" ")
+                    val hit = runCatching { BilibiliApi.searchVideos(keyword) }
+                        .getOrNull()?.firstOrNull()
+                    if (hit == null) null else {
+                        val meta = runCatching { BilibiliApi.getVideoMeta(hit.bvid) }.getOrNull()
+                        ExternalEntry(
+                            bvid = hit.bvid,
+                            title = hit.title,
+                            author = hit.author.ifBlank { entry.author },
+                        ) to (meta?.firstCid ?: 0L)
+                    }
+                }
+            }
+            val (finalEntry, cid) = resolved ?: run { missed++; return@forEachIndexed }
+            val key = if (finalEntry.bvid.isNotEmpty()) finalEntry.bvid to cid
+            else "ext:${finalEntry.extUri}" to 0L
+            if (key in known) return@forEachIndexed
+            known += key
+            pos += 1
+            added += 1
+            db.playlistSongDao().upsertAll(
+                listOf(
+                    PlaylistSongEntity(
+                        playlistId = id,
+                        bvid = key.first,
+                        cid = key.second,
+                        title = finalEntry.title,
+                        author = finalEntry.author,
+                        coverUrl = "",
+                        durationSec = 0,
+                        position = pos,
+                    )
+                )
+            )
+        }
+        onProgress(entries.size, entries.size)
+        return added to missed
+    }
 }

@@ -152,7 +152,10 @@ object Downloads {
         val fresh = runCatching {
             val (bvid, cid) = parseKey(old.id)
             if (bvid.isEmpty() || cid <= 0L) return@runCatching null
-            val url = com.galigalimusic.data.remote.BilibiliApi.getAudioUrl(bvid, cid)
+            val url = com.galigalimusic.data.remote.BilibiliApi.getAudioUrl(
+                bvid, cid,
+                com.galigalimusic.data.remote.AudioQuality.effective(context),
+            )
             DownloadRequest.Builder(old.id, android.net.Uri.parse(url))
                 .setCustomCacheKey(old.customCacheKey)
                 .setData(old.data)

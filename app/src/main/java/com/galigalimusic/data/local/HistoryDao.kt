@@ -24,6 +24,14 @@ interface HistoryDao {
     @Query("UPDATE play_history SET listenedSec = listenedSec + :deltaSec, lastPlayed = :now WHERE bvid = :bvid AND cid = :cid")
     suspend fun addListenTime(bvid: String, cid: Long, deltaSec: Long, now: Long)
 
+    /** 续播位置（不刷新 lastPlayed：仅进度心跳调用，避免历史排序被刷乱） */
+    @Query("UPDATE play_history SET resumePositionMs = :positionMs WHERE bvid = :bvid AND cid = :cid")
+    suspend fun saveResumePosition(bvid: String, cid: Long, positionMs: Long)
+
+    /** 播完/手动重听：续播位置归零 */
+    @Query("UPDATE play_history SET resumePositionMs = 0 WHERE bvid = :bvid AND cid = :cid")
+    suspend fun clearResumePosition(bvid: String, cid: Long)
+
     @Query("SELECT COALESCE(SUM(listenedSec), 0) FROM play_history")
     fun observeTotalListened(): Flow<Long>
 

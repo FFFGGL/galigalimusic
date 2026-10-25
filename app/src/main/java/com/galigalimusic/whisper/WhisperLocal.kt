@@ -108,11 +108,13 @@ object WhisperLocal {
 
     // ===== 歌词文件缓存（按来源分离，避免互相覆盖） =====
 
-    /** 歌词来源：B 站官方字幕 / 本地 whisper 识别 / 外部匹配（LRCLIB） */
+    /** 歌词来源：B 站官方字幕 / 本地 whisper 识别 / 外部匹配（LRCLIB）/ 手工校正 */
     enum class LyricSource(val suffix: String) {
         BILI("bili"),
         WHISPER("whisper"),
         EXT("ext"),
+        /** 手工校正后的整份歌词（优先于所有自动来源） */
+        EDITED("edited"),
     }
 
     fun lyricCacheFile(context: Context, bvid: String, cid: Long, source: LyricSource): File {
@@ -156,7 +158,7 @@ object WhisperLocal {
     }
 
     /**
-     * 按优先级取缓存：官方字幕 > 本地识别。
+     * 按优先级取缓存：手工校正 > 官方字幕 > 本地识别 > 外部匹配。
      * 播放起播时用这个；用户手动切源时按 [LyricSource] 精确读取。
      */
     fun loadPreferredLyricCache(
@@ -164,10 +166,20 @@ object WhisperLocal {
         bvid: String,
         cid: Long,
     ): Pair<List<com.galigalimusic.data.remote.BilibiliApi.LrcLine>, LyricSource>? {
+        loadLyricCache(context, bvid, cid, LyricSource.EDITED)?.let { return it to LyricSource.EDITED }
         loadLyricCache(context, bvid, cid, LyricSource.BILI)?.let { return it to LyricSource.BILI }
         loadLyricCache(context, bvid, cid, LyricSource.WHISPER)?.let { return it to LyricSource.WHISPER }
         loadLyricCache(context, bvid, cid, LyricSource.EXT)?.let { return it to LyricSource.EXT }
         return null
+    }
+
+    /** 是否已有手工校正版 */
+    fun hasEditedCache(context: Context, bvid: String, cid: Long): Boolean =
+        lyricCacheFile(context, bvid, cid, LyricSource.EDITED).exists()
+
+    /** 删掉手工校正版，回退到自动来源 */
+    fun clearEditedCache(context: Context, bvid: String, cid: Long) {
+        runCatching { lyricCacheFile(context, bvid, cid, LyricSource.EDITED).delete() }
     }
 
     /** 是否已经识别过（有 whisper 缓存） */

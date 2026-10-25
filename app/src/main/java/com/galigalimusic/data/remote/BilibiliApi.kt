@@ -24,6 +24,22 @@ object BilibiliApi {
         .callTimeout(30, TimeUnit.SECONDS)
         .cookieJar(BiliSession.jar)
         .addInterceptor { chain ->
+            val req = chain.request()
+            val resp = chain.proceed(req)
+            // C9 风控自愈：HTTP 412 = 反爬拦截，刷新 buvid 后重试一次
+            if (resp.code != 412 || req.header(HDR_RISK_RETRY) != null) return@addInterceptor resp
+            resp.close()
+            val refreshed = runCatching {
+                kotlinx.coroutines.runBlocking { BiliSession.refreshBuvid() }
+            }.getOrDefault(false)
+            val retryReq = if (refreshed) {
+                req.newBuilder().header(HDR_RISK_RETRY, "1").build()
+            } else {
+                req
+            }
+            chain.proceed(retryReq)
+        }
+        .addInterceptor { chain ->
             val req = chain.request().newBuilder()
                 .header("User-Agent", UA)
                 .header("Referer", "https://www.bilibili.com")
@@ -31,6 +47,21 @@ object BilibiliApi {
             chain.proceed(req)
         }
         .build()
+
+    /** 标记「已因风控重试过」，防拦截器无限重试 */
+    private const val HDR_RISK_RETRY = "X-Risk-Retried"
+
+    /** body code=-412 时抛出，[retryOnRiskControl] 捕获后刷新 buvid 重试一次 */
+    private class RiskControlException(message: String) : IllegalStateException(message)
+
+    /** C9 风控自愈：把「刷新 buvid 后重试一次」包进关键请求 */
+    private suspend fun <T> retryOnRiskControl(block: suspend () -> T): T =
+        try {
+            block()
+        } catch (e: RiskControlException) {
+            if (runCatching { BiliSession.refreshBuvid() }.getOrDefault(false)) block()
+            else throw e
+        }
 
     private const val SEARCH_URL = "https://api.bilibili.com/x/web-interface/wbi/search/type"
     private const val VIEW_URL = "https://api.bilibili.com/x/web-interface/view"
@@ -138,43 +169,48 @@ object BilibiliApi {
      * · search/type + 登录态返回正常结果。
      */
     suspend fun searchVideos(keyword: String, page: Int = 1): List<Song> = withContext(Dispatchers.IO) {
-        val params = mapOf(
-            "search_type" to "video",
-            "keyword" to keyword,
-            "page" to page.toString(),
-            "page_size" to "20",
-            "duration" to "0",
-            "tids" to "0",
-            "order_type" to "totalrank",
-        )
-        val signed = WbiSigner.sign(params)
-        val url = buildUrl(SEARCH_URL, signed)
-        val resp = client.newCall(Request.Builder().url(url).build()).execute()
-        val json = JSONObject(resp.body?.string().orEmpty())
-        val code = json.optInt("code", -1)
-        if (code != 0) {
-            throw IllegalStateException("搜索失败 (${code}: ${json.optString("message")})")
-        }
-        val result = json.optJSONObject("data")?.optJSONArray("result")
-            ?: return@withContext emptyList()
-        val songs = mutableListOf<Song>()
-        for (i in 0 until result.length()) {
-            val it = result.optJSONObject(i) ?: continue
-            val bvid = it.optString("bvid").takeIf { b -> b.isNotEmpty() } ?: continue
-            val title = stripHtml(it.optString("title"))
-            val author = it.optString("author")
-            val pic = normalizePic(it.optString("pic"))
-            // search/type 的 duration 是字符串，可能是秒（"212"）或 mm:ss（"3:33"）
-            val duration = it.optString("duration").let { d ->
-                if (d.contains(':')) {
-                    d.split(":").fold(0) { acc, part -> acc * 60 + (part.toIntOrNull() ?: 0) }
-                } else {
-                    d.toIntOrNull() ?: 0
+        // C9：风控（-412）时刷新 buvid 重试一次
+        retryOnRiskControl {
+            val params = mapOf(
+                "search_type" to "video",
+                "keyword" to keyword,
+                "page" to page.toString(),
+                "page_size" to "20",
+                "duration" to "0",
+                "tids" to "0",
+                "order_type" to "totalrank",
+            )
+            val signed = WbiSigner.sign(params)
+            val url = buildUrl(SEARCH_URL, signed)
+            val resp = client.newCall(Request.Builder().url(url).build()).execute()
+            val json = JSONObject(resp.body?.string().orEmpty())
+            val code = json.optInt("code", -1)
+            if (code == -412) throw RiskControlException("触发 B 站风控 (-412)")
+            if (code != 0) {
+                throw IllegalStateException("搜索失败 (${code}: ${json.optString("message")})")
+            }
+            val result = json.optJSONObject("data")?.optJSONArray("result")
+            val songs = mutableListOf<Song>()
+            if (result != null) {
+                for (i in 0 until result.length()) {
+                    val it = result.optJSONObject(i) ?: continue
+                    val bvid = it.optString("bvid").takeIf { b -> b.isNotEmpty() } ?: continue
+                    val title = stripHtml(it.optString("title"))
+                    val author = it.optString("author")
+                    val pic = normalizePic(it.optString("pic"))
+                    // search/type 的 duration 是字符串，可能是秒（"212"）或 mm:ss（"3:33"）
+                    val duration = it.optString("duration").let { d ->
+                        if (d.contains(':')) {
+                            d.split(":").fold(0) { acc, part -> acc * 60 + (part.toIntOrNull() ?: 0) }
+                        } else {
+                            d.toIntOrNull() ?: 0
+                        }
+                    }
+                    songs.add(Song(bvid, title, author, pic, duration))
                 }
             }
-            songs.add(Song(bvid, title, author, pic, duration))
+            songs
         }
-        songs
     }
 
     /** 通过 BV 号直接取视频信息（搜索被风控时的直连播放路径）。 */
@@ -226,6 +262,39 @@ object BilibiliApi {
         }.getOrDefault(emptyList())
     }
 
+    /**
+     * 视频元信息（标题/UP/封面/分P总数 + 第一个分P的 cid），一次 view 请求拿全。
+     * 追更订阅用分P数；外部歌单导入用 firstCid 补全播放所需 cid。
+     */
+    suspend fun getVideoMeta(bvid: String): VideoMeta? = withContext(Dispatchers.IO) {
+        runCatching {
+            val resp = client.newCall(
+                Request.Builder().url("$VIEW_URL?bvid=$bvid").build()
+            ).execute()
+            val json = JSONObject(resp.body?.string().orEmpty())
+            if (json.optInt("code") != 0) return@runCatching null
+            val data = json.getJSONObject("data")
+            val pages = data.optJSONArray("pages")
+            VideoMeta(
+                bvid = bvid,
+                title = stripHtml(data.optString("title")),
+                author = data.optJSONObject("owner")?.optString("name").orEmpty(),
+                coverUrl = normalizePic(data.optString("pic")),
+                pageCount = pages?.length() ?: 0,
+                firstCid = pages?.optJSONObject(0)?.optLong("cid", 0L) ?: 0L,
+            )
+        }.getOrNull()
+    }
+
+    data class VideoMeta(
+        val bvid: String,
+        val title: String,
+        val author: String,
+        val coverUrl: String,
+        val pageCount: Int,
+        val firstCid: Long = 0L,
+    )
+
     /** 获取视频的 cid（音频所在分 P 的 id）。 */
     suspend fun getCid(bvid: String): Long = withContext(Dispatchers.IO) {
         val params = mapOf("bvid" to bvid)
@@ -236,46 +305,64 @@ object BilibiliApi {
         json.getJSONObject("data").getLong("cid")
     }
 
-    /** 获取音频直链（优先最高码率）。 */
-    suspend fun getAudioUrl(bvid: String, cid: Long): String = withContext(Dispatchers.IO) {
-        val params = mapOf(
-            "bvid" to bvid,
-            "cid" to cid.toString(),
-            "qn" to "64",
-            "fnval" to "16",
-            "fourk" to "1",
-        )
-        val signed = WbiSigner.sign(params)
-        val url = buildUrl(PLAYURL_URL, signed)
-        val resp = client.newCall(Request.Builder().url(url).build()).execute()
-        val json = JSONObject(resp.body?.string().orEmpty())
-        val dash = json.getJSONObject("data").getJSONObject("dash")
-        val audio = dash.getJSONArray("audio")
+    /**
+     * 获取音频直链。qn 指定档位（30280/30232/30216）时优先匹配对应流，
+     * 视频没有该档（或未指定）时回退到「稳定 CDN 中最高码率」。
+     */
+    suspend fun getAudioUrl(bvid: String, cid: Long, qn: Int? = null): String = withContext(Dispatchers.IO) {
+        // C9：风控（-412）时刷新 buvid 重试一次
+        retryOnRiskControl {
+            val params = mapOf(
+                "bvid" to bvid,
+                "cid" to cid.toString(),
+                "qn" to "64",
+                "fnval" to "16",
+                "fourk" to "1",
+            )
+            val signed = WbiSigner.sign(params)
+            val url = buildUrl(PLAYURL_URL, signed)
+            val resp = client.newCall(Request.Builder().url(url).build()).execute()
+            val json = JSONObject(resp.body?.string().orEmpty())
+            if (json.optInt("code", 0) == -412) {
+                throw RiskControlException("触发 B 站风控 (-412)")
+            }
+            val dash = json.getJSONObject("data").getJSONObject("dash")
+            val audio = dash.getJSONArray("audio")
 
-        // mcdn/:8082 是 P2P CDN，下载/播放经常中途断流（实测 8.6MB 处反复 403/断连）。
-        // 优先选普通 upos/mirror CDN 的候选；baseUrl 全是 mcdn 时改用 backupUrl 里的普通 CDN。
-        fun isStable(u: String): Boolean =
-            u.isNotEmpty() && !u.contains("mcdn") && !u.contains(":8082")
-        var best: JSONObject? = null
-        var bestP2p: JSONObject? = null
-        for (i in 0 until audio.length()) {
-            val a = audio.optJSONObject(i) ?: continue
-            if (isStable(a.optString("baseUrl"))) {
-                if (best == null || a.optInt("bandwidth") > best.optInt("bandwidth")) best = a
-            } else if (bestP2p == null) {
-                bestP2p = a
+            // mcdn/:8082 是 P2P CDN，下载/播放经常中途断流（实测 8.6MB 处反复 403/断连）。
+            // 优先选普通 upos/mirror CDN 的候选；baseUrl 全是 mcdn 时改用 backupUrl 里的普通 CDN。
+            fun isStable(u: String): Boolean =
+                u.isNotEmpty() && !u.contains("mcdn") && !u.contains(":8082")
+            var best: JSONObject? = null
+            var bestP2p: JSONObject? = null
+            var qnMatch: JSONObject? = null
+            var qnMatchP2p: JSONObject? = null
+            for (i in 0 until audio.length()) {
+                val a = audio.optJSONObject(i) ?: continue
+                val matchQn = qn != null && a.optInt("id") == qn
+                if (isStable(a.optString("baseUrl"))) {
+                    if (matchQn && qnMatch == null) qnMatch = a
+                    if (best == null || a.optInt("bandwidth") > best.optInt("bandwidth")) best = a
+                } else {
+                    if (matchQn && qnMatchP2p == null) qnMatchP2p = a
+                    if (bestP2p == null) bestP2p = a
+                }
+            }
+            val chosen = qnMatch ?: qnMatchP2p ?: best ?: bestP2p
+            if (chosen == null) {
+                ""
+            } else {
+                var picked = chosen.optString("baseUrl")
+                if (!isStable(picked)) {
+                    val backups = chosen.optJSONArray("backupUrl")
+                    for (i in 0 until (backups?.length() ?: 0)) {
+                        val u = backups?.optString(i).orEmpty()
+                        if (isStable(u)) { picked = u; break }
+                    }
+                }
+                picked
             }
         }
-        val chosen = best ?: bestP2p ?: return@withContext ""
-        var picked = chosen.optString("baseUrl")
-        if (!isStable(picked)) {
-            val backups = chosen.optJSONArray("backupUrl")
-            for (i in 0 until (backups?.length() ?: 0)) {
-                val u = backups?.optString(i).orEmpty()
-                if (isStable(u)) { picked = u; break }
-            }
-        }
-        picked
     }
 
     private fun buildUrl(base: String, params: Map<String, String>): String {

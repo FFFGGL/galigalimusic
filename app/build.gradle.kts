@@ -24,8 +24,8 @@ android {
         applicationId = "com.galigalimusic.app"
         minSdk = 24
         targetSdk = 36
-        versionCode = 3
-        versionName = "1.2"
+        versionCode = 4
+        versionName = "1.3"
         ndk {
             // whisper.cpp 只编 arm64（真机），缩短原生编译时间
             abiFilters += "arm64-v8a"
@@ -128,6 +128,9 @@ dependencies {
 
     // Image loading
     implementation("io.coil-kt:coil-compose:2.7.0")
+
+    // 追更提醒：周期检查订阅合集更新（B6）
+    implementation("androidx.work:work-runtime-ktx:2.10.1")
 
     // QR code generation (登录扫码)，纯 Java 无相机依赖
     implementation("com.google.zxing:core:3.5.3")

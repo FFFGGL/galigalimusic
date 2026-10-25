@@ -22,9 +22,10 @@ class MusicRepository(private val db: AppDatabase) {
         author: String,
         coverUrl: String,
         durationSec: Int,
+        qn: Int? = null,
     ): ResolvedTrack {
-        val url = BilibiliApi.getAudioUrl(bvid, cid)
-        // 保留累计收听时长：upsert 是 REPLACE 语义，直接覆盖会把统计清零
+        val url = BilibiliApi.getAudioUrl(bvid, cid, qn)
+        // 保留累计收听时长与续播位置：upsert 是 REPLACE 语义，直接覆盖会把统计清零
         val prev = db.historyDao().getByKey(bvid, cid)
         db.historyDao().upsert(
             HistoryEntity(
@@ -35,6 +36,7 @@ class MusicRepository(private val db: AppDatabase) {
                 coverUrl = coverUrl,
                 durationSec = durationSec,
                 listenedSec = prev?.listenedSec ?: 0L,
+                resumePositionMs = prev?.resumePositionMs ?: 0L,
             )
         )
         return ResolvedTrack(url, cid)
@@ -51,7 +53,19 @@ class MusicRepository(private val db: AppDatabase) {
     suspend fun addListenTime(bvid: String, cid: Long, deltaSec: Long) =
         db.historyDao().addListenTime(bvid, cid, deltaSec, System.currentTimeMillis())
 
+    /** 续播位置刷入（播放心跳定期调用） */
+    suspend fun saveResumePosition(bvid: String, cid: Long, positionMs: Long) =
+        db.historyDao().saveResumePosition(bvid, cid, positionMs)
+
+    /** 续播位置归零（自然播完时） */
+    suspend fun clearResumePosition(bvid: String, cid: Long) =
+        db.historyDao().clearResumePosition(bvid, cid)
+
     suspend fun deleteHistoryOne(bvid: String, cid: Long) = db.historyDao().deleteOne(bvid, cid)
 
     suspend fun getHistoryKey(bvid: String, cid: Long) = db.historyDao().getByKey(bvid, cid)
+
+    /** 该视频最近听过的一集（追更列表续播用） */
+    suspend fun getHistoryLatestForBvid(bvid: String) =
+        db.historyDao().getByBvid(bvid)
 }

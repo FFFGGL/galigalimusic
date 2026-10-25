@@ -28,6 +28,7 @@ import com.galigalimusic.data.local.PlaylistEntity
 import com.galigalimusic.data.remote.BiliSession
 import com.galigalimusic.data.remote.BilibiliApi
 import com.galigalimusic.data.repository.PlaylistRepository
+import com.galigalimusic.data.repository.ExternalPlaylistParser
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -133,6 +134,59 @@ class PlaylistsViewModel(private val repo: PlaylistRepository) : ViewModel() {
                 .onFailure { onDone("导入失败：${it.message ?: "文件格式不对"}") }
         }
     }
+
+    // ===== B7 外部歌单导入（m3u / 歌单名清单） =====
+    data class ExternalProgress(val done: Int, val total: Int)
+
+    private val _externalProgress = MutableStateFlow<ExternalProgress?>(null)
+    val externalProgress: StateFlow<ExternalProgress?> = _externalProgress
+
+    /**
+     * 统一外部导入入口：按内容嗅探类型分流。
+     * JSON 走备份导入；m3u / 歌单名清单走 importExternal（需要联网补全信息）。
+     */
+    fun importExternal(text: String, fileName: String?, onDone: (String) -> Unit) {
+        when (ExternalPlaylistParser.detect(text)) {
+            ExternalPlaylistParser.ImportKind.JSON -> {
+                importJson(text, onDone)
+                return
+            }
+            ExternalPlaylistParser.ImportKind.M3U,
+            ExternalPlaylistParser.ImportKind.LIST -> Unit
+        }
+        viewModelScope.launch {
+            val entries = when (ExternalPlaylistParser.detect(text)) {
+                ExternalPlaylistParser.ImportKind.M3U ->
+                    ExternalPlaylistParser.parseM3u(text)
+                ExternalPlaylistParser.ImportKind.LIST ->
+                    ExternalPlaylistParser.parseList(text)
+                ExternalPlaylistParser.ImportKind.JSON -> emptyList()
+            }
+            if (entries.isEmpty()) {
+                onDone("没有解析到有效条目")
+                return@launch
+            }
+            val name = ExternalPlaylistParser.playlistNameFromFile(fileName)
+            _externalProgress.value = ExternalProgress(0, entries.size)
+            runCatching {
+                repo.importExternal(name, entries) { done, total ->
+                    _externalProgress.value = ExternalProgress(done, total)
+                }
+            }.onSuccess { (added, missed) ->
+                _externalProgress.value = null
+                onDone(
+                    buildString {
+                        append("导入「$name」：新增 $added 首")
+                        if (missed > 0) append("，$missed 首未匹配")
+                        append(" ✓")
+                    }
+                )
+            }.onFailure {
+                _externalProgress.value = null
+                onDone("导入失败：${it.message ?: "文件格式不对"}")
+            }
+        }
+    }
 }
 
 @Composable
@@ -181,9 +235,40 @@ fun PlaylistsScreen(
                     context.contentResolver.openInputStream(uri)?.bufferedReader()?.readText()
                 }.getOrNull()
                 if (text.isNullOrEmpty()) onToast("读取文件失败")
-                else vm.importJson(text, onToast)
+                else vm.importExternal(text, queryDisplayName(context, uri), onToast)
             }
         }
+    }
+
+    // B7：外部导入进度（m3u/清单需要联网逐条补全信息）
+    val externalProgress by vm.externalProgress.collectAsState()
+    if (externalProgress != null) {
+        val p = externalProgress!!
+        AlertDialog(
+            onDismissRequest = {},
+            title = { Text("正在导入") },
+            text = {
+                Column {
+                    Text("逐条匹配歌曲信息，请稍候…")
+                    Spacer(Modifier.height(12.dp))
+                    LinearProgressIndicator(
+                        progress = {
+                            if (p.total > 0) p.done.toFloat() / p.total else 0f
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    if (p.total > 0) {
+                        Text(
+                            "${p.done} / ${p.total}",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(top = 6.dp),
+                        )
+                    }
+                }
+            },
+            confirmButton = {},
+        )
     }
 
     Column(modifier = Modifier.fillMaxSize().padding(horizontal = 16.dp)) {        Spacer(Modifier.height(16.dp))
@@ -204,7 +289,15 @@ fun PlaylistsScreen(
                 Icon(Icons.Rounded.FileDownload, contentDescription = "导出备份")
             }
             IconButton(onClick = {
-                importLauncher.launch(arrayOf("application/json", "text/plain"))
+                // m3u 在多数文件管理器里注册为 audio/x-mpegurl 或 text/plain
+                importLauncher.launch(
+                    arrayOf(
+                        "application/json",
+                        "text/plain",
+                        "audio/x-mpegurl",
+                        "application/vnd.apple.mpegurl",
+                    )
+                )
             }) {
                 Icon(Icons.Rounded.FileUpload, contentDescription = "导入备份")
             }
@@ -409,3 +502,12 @@ private fun ImportFavDialog(
         },
     )
 }
+
+/** SAF uri 的显示文件名（外部导入时用作歌单名） */
+private fun queryDisplayName(context: android.content.Context, uri: android.net.Uri): String? =
+    runCatching {
+        context.contentResolver.query(uri, null, null, null, null)?.use { c ->
+            val idx = c.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
+            if (idx >= 0 && c.moveToFirst()) c.getString(idx) else null
+        }
+    }.getOrNull()
