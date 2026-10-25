@@ -9,6 +9,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.toArgb
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.isActive
@@ -25,8 +26,11 @@ object ThemeEngine {
     /** 当前播放封面提取出的主色；null = 未播放或取色关闭 */
     val accent = MutableStateFlow<Color?>(null)
 
-    /** 动态取色开关（设置页可关，关闭后回退 bilibili 粉基调） */
+    /** 动态取色开关（设置页可关，关闭后用手动主题色或回退 bilibili 粉基调） */
     val dynamicColor = MutableStateFlow(true)
+
+    /** 手动主题色（设置页色板选择，选中即自动关闭动态取色）；null = 未选择 */
+    val manualAccent = MutableStateFlow<Color?>(null)
 
     // ===== C10 AMOLED 纯黑 =====
 
@@ -47,6 +51,7 @@ object ThemeEngine {
 
     private const val PREFS = "theme_prefs"
     private const val KEY_DYNAMIC = "dynamic"
+    private const val KEY_MANUAL_ACCENT = "manual_accent"
     private const val KEY_AMOLED = "amoled_manual"
     private const val KEY_SCHED_ON = "amoled_sched_on"
     private const val KEY_SCHED_START = "amoled_sched_start"
@@ -61,6 +66,8 @@ object ThemeEngine {
         val p = context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         prefs = p
         dynamicColor.value = p.getBoolean(KEY_DYNAMIC, true)
+        val argb = p.getInt(KEY_MANUAL_ACCENT, -1)
+        manualAccent.value = if (argb == -1) null else Color(argb)
         amoledManual.value = p.getBoolean(KEY_AMOLED, false)
         amoledSchedOn.value = p.getBoolean(KEY_SCHED_ON, false)
         amoledSchedStart.value = p.getInt(KEY_SCHED_START, 22)
@@ -71,6 +78,16 @@ object ThemeEngine {
     fun setDynamicColor(on: Boolean) {
         dynamicColor.value = on
         prefs?.edit()?.putBoolean(KEY_DYNAMIC, on)?.apply()
+    }
+
+    /** 选择预设主题色：固定色模式，同时关闭封面动态取色 */
+    fun setManualAccent(color: Color) {
+        manualAccent.value = color
+        dynamicColor.value = false
+        prefs?.edit()
+            ?.putInt(KEY_MANUAL_ACCENT, color.toArgb())
+            ?.putBoolean(KEY_DYNAMIC, false)
+            ?.apply()
     }
 
     fun setAmoledManual(on: Boolean) {
@@ -119,6 +136,20 @@ private fun blend(a: Color, b: Color, fraction: Float): Color = Color(
 
 private fun lighten(c: Color, f: Float) = blend(c, Color.White, f)
 private fun darken(c: Color, f: Float) = blend(c, Color.Black, f)
+
+/** 预设主题色板（顺序即设置页展示顺序） */
+data class ThemeColor(val name: String, val color: Color)
+
+val ThemePalette = listOf(
+    ThemeColor("B站粉", Color(0xFFFB7299)),
+    ThemeColor("海蓝", Color(0xFF6AA5FF)),
+    ThemeColor("湖青", Color(0xFF3FC1B0)),
+    ThemeColor("苔绿", Color(0xFF7BC562)),
+    ThemeColor("暖金", Color(0xFFE5B546)),
+    ThemeColor("落日橙", Color(0xFFF08A4B)),
+    ThemeColor("山茶红", Color(0xFFF0627A)),
+    ThemeColor("薰衣草", Color(0xFFA98FE8)),
+)
 
 /** 由一个强调色派生方案 B 深色主题（近似 Material You tonal 角色）。 */
 fun planBDarkScheme(accent: Color?): ColorScheme {
@@ -189,6 +220,7 @@ fun planBAmoledScheme(accent: Color?): ColorScheme =
 fun GaligaliMusicTheme(content: @Composable () -> Unit) {
     val accent by ThemeEngine.accent.collectAsState()
     val dynamic by ThemeEngine.dynamicColor.collectAsState()
+    val manual by ThemeEngine.manualAccent.collectAsState()
     val amoled by ThemeEngine.amoledActive.collectAsState()
 
     // 定时切换：每分钟重算一次，跨小时边界准时生效
@@ -201,7 +233,8 @@ fun GaligaliMusicTheme(content: @Composable () -> Unit) {
         }
     }
 
-    val seed = if (dynamic) accent else null
+    // 取色优先级：动态取色开 → 封面主色；否则 → 手动主题色；都没有 → 默认 bilibili 粉
+    val seed = if (dynamic) accent else manual
     val scheme = if (amoled) planBAmoledScheme(seed) else planBDarkScheme(seed)
     MaterialTheme(colorScheme = scheme, content = content)
 }

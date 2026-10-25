@@ -1,6 +1,11 @@
 package com.galigalimusic.ui.screens
 
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -8,14 +13,20 @@ import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.Check
+import androidx.compose.material.icons.rounded.Image
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.FilledTonalButton
+import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -33,6 +44,8 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.launch
@@ -41,10 +54,12 @@ import com.galigalimusic.data.remote.BiliSession
 import com.galigalimusic.data.remote.ExternalSources
 import com.galigalimusic.player.MediaCache
 import com.galigalimusic.ui.theme.ThemeEngine
+import com.galigalimusic.ui.theme.ThemePalette
 
 @Composable
 fun SettingsScreen(db: com.galigalimusic.data.local.AppDatabase) {
     val dynamicColor by ThemeEngine.dynamicColor.collectAsState()
+    val manualAccent by ThemeEngine.manualAccent.collectAsState()
     // C10：AMOLED 纯黑状态
     val amoledManual by ThemeEngine.amoledManual.collectAsState()
     val amoledSchedOn by ThemeEngine.amoledSchedOn.collectAsState()
@@ -145,12 +160,43 @@ fun SettingsScreen(db: com.galigalimusic.data.local.AppDatabase) {
             modifier = Modifier.fillMaxWidth(),
         ) {
             Column(Modifier.padding(vertical = 4.dp)) {
-                SettingSwitch(
-                    title = "封面动态取色",
-                    subtitle = "整套界面强调色随播放封面变化（方案 B 核心）",
-                    checked = dynamicColor,
-                    onChecked = { ThemeEngine.setDynamicColor(it) },
-                )
+                // 主题色板：跟随封面自动取色 + 预设色块
+                Column {
+                    Text(
+                        "主题色",
+                        style = MaterialTheme.typography.bodyLarge,
+                        modifier = Modifier.padding(horizontal = 16.dp),
+                    )
+                    Text(
+                        text = if (dynamicColor) "跟随封面自动取色"
+                        else ThemePalette.firstOrNull { it.color == manualAccent }?.name ?: "B站粉",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(horizontal = 16.dp),
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .horizontalScroll(rememberScrollState())
+                            .padding(horizontal = 16.dp),
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        ThemeSwatchAuto(
+                            selected = dynamicColor,
+                            onClick = { ThemeEngine.setDynamicColor(true) },
+                        )
+                        ThemePalette.forEach { tc ->
+                            ThemeSwatch(
+                                color = tc.color,
+                                selected = !dynamicColor && manualAccent == tc.color,
+                                onClick = { ThemeEngine.setManualAccent(tc.color) },
+                            )
+                        }
+                    }
+                    Spacer(Modifier.height(10.dp))
+                }
                 // C10：AMOLED 纯黑 + 定时启用
                 SettingSwitch(
                     title = "AMOLED 纯黑",
@@ -587,7 +633,7 @@ fun SettingsScreen(db: com.galigalimusic.data.local.AppDatabase) {
             Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                 Text("galigalimusic · 原生版", style = MaterialTheme.typography.bodyMedium)
                 Text(
-                    "UI：方案 B（Material You 动态取色） · 数据来源：Bilibili",
+                    "UI：方案 B 动态取色 + 主题色板 · 数据来源：Bilibili",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -700,6 +746,58 @@ private fun SettingSwitch(
         }
         Spacer(Modifier.width(8.dp))
         Switch(checked = checked, onCheckedChange = onChecked, enabled = enabled)
+    }
+}
+
+/** 主题色板色块：填充色 + 选中外环 + 亮度自适应对勾 */
+@Composable
+private fun ThemeSwatch(color: Color, selected: Boolean, onClick: () -> Unit) {
+    val checkTint =
+        if (color.red * 0.299f + color.green * 0.587f + color.blue * 0.114f > 0.62f) Color.Black
+        else Color.White
+    Box(
+        modifier = Modifier
+            .size(40.dp)
+            .clip(CircleShape)
+            .background(color)
+            .border(
+                width = if (selected) 3.dp else 1.dp,
+                color = if (selected) MaterialTheme.colorScheme.onSurface
+                else MaterialTheme.colorScheme.outlineVariant,
+                shape = CircleShape,
+            )
+            .clickable(onClick = onClick),
+        contentAlignment = Alignment.Center,
+    ) {
+        if (selected) {
+            Icon(Icons.Rounded.Check, contentDescription = null, tint = checkTint, modifier = Modifier.size(20.dp))
+        }
+    }
+}
+
+/** 主题色板「跟随封面」档：无固定色，选中态同样外环标识 */
+@Composable
+private fun ThemeSwatchAuto(selected: Boolean, onClick: () -> Unit) {
+    Box(
+        modifier = Modifier
+            .size(40.dp)
+            .clip(CircleShape)
+            .background(MaterialTheme.colorScheme.surfaceContainerHighest)
+            .border(
+                width = if (selected) 3.dp else 1.dp,
+                color = if (selected) MaterialTheme.colorScheme.onSurface
+                else MaterialTheme.colorScheme.outlineVariant,
+                shape = CircleShape,
+            )
+            .clickable(onClick = onClick),
+        contentAlignment = Alignment.Center,
+    ) {
+        Icon(
+            Icons.Rounded.Image,
+            contentDescription = "跟随封面",
+            tint = MaterialTheme.colorScheme.primary,
+            modifier = Modifier.size(20.dp),
+        )
     }
 }
 
