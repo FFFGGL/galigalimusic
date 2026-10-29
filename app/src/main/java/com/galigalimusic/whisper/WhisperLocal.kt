@@ -201,15 +201,45 @@ object WhisperLocal {
             if (!resp.isSuccessful) throw IllegalStateException("音频下载失败 HTTP ${resp.code}")
             val body = resp.body ?: throw IllegalStateException("音频下载空响应")
             val total = body.contentLength()
+            val acc = java.util.concurrent.atomic.AtomicLong(0)
             body.byteStream().use { input ->
                 dest.outputStream().use { output ->
                     val buf = ByteArray(256 * 1024)
                     var read: Int
-                    var acc = 0L
                     while (input.read(buf).also { read = it } != -1) {
                         output.write(buf, 0, read)
-                        acc += read
-                        if (total > 0) onProgress((acc * 100 / total).toInt())
+                        acc.addAndGet(read.toLong())
+                        if (total > 0) onProgress((acc.get() * 100 / total).toInt())
+                    }
+                }
+            }
+            // 关键：断流时 read() 会提前返回 -1，不校验就会把「半截文件」当完整文件用。
+            // 而容器头里声明的时长仍是完整的，解码时会在数据末尾挂住（华为 CCodec 不回 EOS）。
+            // 这里发现短了就重下一次，仍短则明确报错，别让用户等十来分钟才失败。
+            if (total > 0 && acc.get() < total * 99 / 100) {
+                dest.delete()
+                val got = acc.get()
+                val req2 = req.newBuilder().build()
+                client.newCall(req2).execute().use { r2 ->
+                    if (!r2.isSuccessful) throw IllegalStateException("音频下载失败 HTTP ${r2.code}")
+                    val b2 = r2.body ?: throw IllegalStateException("音频下载空响应")
+                    val t2 = b2.contentLength()
+                    val a2 = java.util.concurrent.atomic.AtomicLong(0)
+                    b2.byteStream().use { i2 ->
+                        dest.outputStream().use { o2 ->
+                            val buf2 = ByteArray(256 * 1024)
+                            var rd: Int
+                            while (i2.read(buf2).also { rd = it } != -1) {
+                                o2.write(buf2, 0, rd)
+                                a2.addAndGet(rd.toLong())
+                                if (t2 > 0) onProgress((a2.get() * 100 / t2).toInt())
+                            }
+                        }
+                    }
+                    if (t2 > 0 && a2.get() < t2 * 99 / 100) {
+                        throw IllegalStateException(
+                            "音频下载不完整（$got/${total}B，重试后 ${a2.get()}/${t2}B），请检查网络后重试"
+                        )
                     }
                 }
             }

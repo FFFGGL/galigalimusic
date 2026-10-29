@@ -806,9 +806,11 @@ private fun LyricPanel(
                                 )
                             }
                         }
-                        // 完成后提示「共 N 句（仅前 20 分钟）」，6 秒后由 VM 自动收起：
-                        // 长音频只识别前一段，不告诉用户会以为是整集都识别了
-                        com.galigalimusic.viewmodel.PlayerViewModel.RecognizeState.DONE -> {
+                        // 完成后提示「共 N 句（仅前 20 分钟）」，10 秒后由 VM 清空 msg：
+                        // 长音频只识别前一段，不告诉用户会以为是整集都识别了。
+                        // 只判 msg 非空而不判 DONE 状态——状态会被定时器先复位，
+                        // 之前绑在 DONE 上导致提示根本来不及显示。
+                        else -> {
                             if (recognizeMsg.isNotEmpty()) {
                                 Text(
                                     recognizeMsg,
@@ -819,7 +821,6 @@ private fun LyricPanel(
                                 )
                             }
                         }
-                        else -> Unit
                     }
                 }
             }

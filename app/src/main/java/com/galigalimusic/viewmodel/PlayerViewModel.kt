@@ -582,11 +582,18 @@ class PlayerViewModel(
                             if (_recognizeState.value != RecognizeState.TRANSCRIBING) {
                                 _recognizeState.value = RecognizeState.TRANSCRIBING
                             }
+                            val t0 = android.os.SystemClock.elapsedRealtime()
                             val json = com.galigalimusic.whisper.WhisperNative
                                 .transcribeSamples(ptr, samples, language, threads)
+                            val cost = android.os.SystemClock.elapsedRealtime() - t0
                             BiliSession.appendDebug(
-                                "whisper slice: jsonLen=${json.length} head=${json.take(120)}"
+                                "whisper slice: ${cost}ms jsonLen=${json.length} head=${json.take(120)}"
                             )
+                            // 单段超过 3 分钟 = 推理异常（正常 15~25s）。
+                            // 记一笔，配合 CANCELLED 日志区分是推理卡住还是协程被外部取消
+                            if (cost > 180_000) {
+                                BiliSession.appendDebug("whisper WARN: slow slice ${cost}ms")
+                            }
                             com.galigalimusic.whisper.WhisperLocal.parseNativeJson(json)
                         },
                         // lines 时间戳已由 WhisperAudio 换算成整集绝对毫秒，这里直接追加
@@ -613,6 +620,7 @@ class PlayerViewModel(
                         debugSink = { dbg(it) },
                     )
                     // 统一收口：有结果就落盘（取消也保留），再按状态给用户明确反馈
+                    dbg("stream done: lines=${acc.size} cancel=$recognizeCancel state=${_recognizeState.value}")
                     if (acc.isNotEmpty()) {
                         com.galigalimusic.whisper.WhisperLocal.saveLyricCache(
                             appContext, cur.bvid, cur.cid,
@@ -627,6 +635,7 @@ class PlayerViewModel(
                             val tail = if (capped) "（仅前 ${RECOGNIZE_MAX_SEC / 60} 分钟）" else ""
                             "识别完成，共 ${acc.size} 句$tail"
                         }
+                        dbg("DONE: msg=${_recognizeMsg.value}")
                         // 提示挂 10 秒自动收起，别长期占着歌词区底部
                         viewModelScope.launch {
                             kotlinx.coroutines.delay(10_000)
@@ -643,12 +652,27 @@ class PlayerViewModel(
                         throw IllegalStateException("未识别出语音内容，可能是纯音乐或音量过低")
                     }
                 } finally {
-                    com.galigalimusic.whisper.WhisperNative.freeContext(ptr)
+                    // freeContext 内部走 JNI，native 侧异常会原样抛出来；
+                    // 若不吞掉，它会在正常返回路径上制造一个新异常，把「识别完成」
+                    // 变成无声失败（日志里连 FAILED 都没有，因为异常发生在 catch 之外）
+                    runCatching { com.galigalimusic.whisper.WhisperNative.freeContext(ptr) }
+                        .onFailure { dbg("freeContext failed: $it") }
                 }
             } catch (e: kotlinx.coroutines.CancellationException) {
-                _recognizeState.value = RecognizeState.IDLE
-                _recognizeProgress.value = 0
-                _recognizeMsg.value = "已取消"
+                // 用户主动取消 vs 协程被外部取消（ViewModel 被清、作用域取消）表现一样，
+                // 但后者是 bug：日志里必须能区分，否则「识别无声消失」根本查不到原因
+                dbg(
+                    "CANCELLED: cancelFlag=$recognizeCancel " +
+                    "state=${_recognizeState.value} slices=${_recognizeProgress.value} coroutineActive=${isActive}"
+                )
+                if (recognizeCancel) {
+                    _recognizeState.value = RecognizeState.IDLE
+                    _recognizeProgress.value = 0
+                    _recognizeMsg.value = "已取消"
+                } else {
+                    _recognizeState.value = RecognizeState.ERROR
+                    _recognizeMsg.value = "识别被中断，请重试"
+                }
             } catch (e: Exception) {
                 dbg("FAILED: $e")
                 _recognizeState.value = RecognizeState.ERROR
@@ -670,7 +694,10 @@ class PlayerViewModel(
                 "网络不可用，模型或音频下载失败"
             e is java.net.SocketTimeoutException -> "网络超时，请检查网络后重试"
             m.contains("HTTP 4") || m.contains("HTTP 5") -> "下载失败（$m），请稍后重试"
-            m.contains("不完整") -> "模型文件下载不完整，请重试"
+            // 下载音频断流（downloadAudio 校验出来的）——比模型那条更具体，先判
+            m.contains("音频下载不完整") || m.contains("音频下载失败") ||
+                m.contains("音频下载空响应") -> "音频下载中断，请检查网络后重试"
+            m.contains("模型文件下载不完整") -> "模型文件下载不完整，请重试"
             m.contains("没有音频轨") -> "该音频没有可解码的音轨"
             // 拖过进度条后老版本会拼出「半真半假」的缓存文件，解码出静音落到这里。
             // 现在已改为自动重下完整音频，正常不会再触发，保留为兜底并给可执行建议。
