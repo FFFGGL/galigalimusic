@@ -104,7 +104,10 @@ fun DownloadsScreen(
         Spacer(Modifier.height(16.dp))
         Row(verticalAlignment = Alignment.CenterVertically) {
             IconButton(onClick = onBack) { Text("←", style = MaterialTheme.typography.titleLarge) }
-            Text("离线下载", style = MaterialTheme.typography.headlineSmall)
+            // 选择模式隐藏标题：给「全选/删除(N)/完成」让位，窄屏不溢出
+            if (!selectionMode) {
+                Text("离线下载", style = MaterialTheme.typography.headlineSmall)
+            }
             Spacer(Modifier.weight(1f))
             if (selectionMode) {
                 TextButton(onClick = {

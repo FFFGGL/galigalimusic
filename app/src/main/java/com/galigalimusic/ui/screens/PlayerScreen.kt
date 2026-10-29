@@ -10,6 +10,7 @@ import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxHeight
@@ -86,6 +87,8 @@ fun PlayerScreen(
     val resolving by playerVm.resolving.collectAsState()
     val history by playerVm.history.collectAsState()
     val queue by playerVm.queue.collectAsState()
+    val sleepRemaining by playerVm.sleepRemainingSec.collectAsState()
+    val sleepTracks by playerVm.sleepTracksRemaining.collectAsState()
     val boostOn by playerVm.volumeBoost.collectAsState()
     var seeking by remember { mutableStateOf<Float?>(null) }
 
@@ -171,8 +174,6 @@ fun PlayerScreen(
                     )
                 }
                 Spacer(Modifier.weight(1f))
-                val sleepRemaining by playerVm.sleepRemainingSec.collectAsState()
-                val sleepTracks by playerVm.sleepTracksRemaining.collectAsState()
                 IconButton(onClick = { showSleepTimer = true }) {
                     Icon(
                         Icons.Rounded.Timer,
@@ -307,8 +308,8 @@ fun PlayerScreen(
             }
             if (showSleepTimer) {
                 SleepTimerDialog(
-                    remainingSec = playerVm.sleepRemainingSec.value,
-                    tracksRemaining = playerVm.sleepTracksRemaining.value,
+                    remainingSec = sleepRemaining,
+                    tracksRemaining = sleepTracks,
                     onPick = { minutes ->
                         if (minutes > 0) playerVm.setSleepTimer(minutes) else playerVm.clearSleepTimer()
                         showSleepTimer = false
@@ -432,7 +433,10 @@ private fun SkipHeadTailDialog(
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 Text("片头（起播自动跳过）", style = MaterialTheme.typography.labelMedium)
-                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                FlowRow(
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
                     headOptions.forEach { s ->
                         FilledTonalButton(
                             onClick = { head = s },
@@ -446,7 +450,10 @@ private fun SkipHeadTailDialog(
                     }
                 }
                 Text("片尾（提前切下一集）", style = MaterialTheme.typography.labelMedium)
-                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                FlowRow(
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
                     tailOptions.forEach { s ->
                         FilledTonalButton(
                             onClick = { tail = s },
@@ -505,13 +512,19 @@ private fun SleepTimerDialog(
                     )
                 }
                 Text("按时间", style = MaterialTheme.typography.labelSmall, color = cs.onSurfaceVariant)
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                FlowRow(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
                     listOf(15, 30, 60, 90).forEach { m ->
                         FilledTonalButton(onClick = { onPick(m) }) { Text("$m 分钟") }
                     }
                 }
                 Text("按集数", style = MaterialTheme.typography.labelSmall, color = cs.onSurfaceVariant)
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                FlowRow(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
                     listOf(1, 2, 3, 5).forEach { n ->
                         FilledTonalButton(onClick = { onPickTracks(n) }) { Text("$n 集") }
                     }
@@ -527,10 +540,11 @@ private fun SleepTimerDialog(
 
 /**
  * 分P 选集面板（Plan B 下拉弹层）：列出全部分P，当前项高亮，点击切换播放。
+ * 非 private：歌词页（LyricsScreen）也复用它做「分P 选择列表」。
  */
 @OptIn(androidx.compose.material3.ExperimentalMaterial3Api::class)
 @Composable
-private fun PagesSheet(
+fun PagesSheet(
     pages: List<com.galigalimusic.data.remote.BilibiliApi.VideoPage>,
     currentCid: Long,
     onPick: (com.galigalimusic.data.remote.BilibiliApi.VideoPage) -> Unit,
@@ -774,22 +788,38 @@ private fun LyricPanel(
                         onSeek = { onOpenLyrics() },
                         modifier = Modifier.weight(1f).fillMaxWidth(),
                     )
-                    if (recognizeState == com.galigalimusic.viewmodel.PlayerViewModel.RecognizeState.TRANSCRIBING) {
-                        Row(
-                            modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 2.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                        ) {
-                            LinearProgressIndicator(
-                                progress = { recognizeProgress / 100f },
-                                modifier = Modifier.weight(1f).height(3.dp),
-                            )
-                            Spacer(Modifier.width(8.dp))
-                            Text(
-                                "识别中 $recognizeProgress%",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = cs.onSurfaceVariant,
-                            )
+                    when (recognizeState) {
+                        com.galigalimusic.viewmodel.PlayerViewModel.RecognizeState.TRANSCRIBING -> {
+                            Row(
+                                modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 2.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                LinearProgressIndicator(
+                                    progress = { recognizeProgress / 100f },
+                                    modifier = Modifier.weight(1f).height(3.dp),
+                                )
+                                Spacer(Modifier.width(8.dp))
+                                Text(
+                                    "识别中 $recognizeProgress%",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = cs.onSurfaceVariant,
+                                )
+                            }
                         }
+                        // 完成后提示「共 N 句（仅前 20 分钟）」，6 秒后由 VM 自动收起：
+                        // 长音频只识别前一段，不告诉用户会以为是整集都识别了
+                        com.galigalimusic.viewmodel.PlayerViewModel.RecognizeState.DONE -> {
+                            if (recognizeMsg.isNotEmpty()) {
+                                Text(
+                                    recognizeMsg,
+                                    modifier = Modifier.fillMaxWidth()
+                                        .padding(horizontal = 12.dp, vertical = 2.dp),
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = cs.onSurfaceVariant,
+                                )
+                            }
+                        }
+                        else -> Unit
                     }
                 }
             }

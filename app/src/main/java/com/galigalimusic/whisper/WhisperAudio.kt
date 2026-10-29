@@ -84,6 +84,31 @@ object WhisperAudio {
     }
 
     /**
+     * 读音频轨时长（毫秒）；读不到返回 0。
+     * 用于判断缓存导出的是否只是「播到一半」的片段——这种文件容器完好、能解析，
+     * 但内容不全，识别会静默只出前半段歌词。
+     */
+    fun audioDurationMs(path: String): Long = try {
+        val ex = MediaExtractor()
+        try {
+            ex.setDataSource(path)
+            var best = 0L
+            for (i in 0 until ex.trackCount) {
+                val f = ex.getTrackFormat(i)
+                if (f.getString(MediaFormat.KEY_MIME)?.startsWith("audio/") != true) continue
+                if (f.containsKey(MediaFormat.KEY_DURATION)) {
+                    best = maxOf(best, f.getLong(MediaFormat.KEY_DURATION) / 1000L)
+                }
+            }
+            best
+        } finally {
+            runCatching { ex.release() }
+        }
+    } catch (e: Exception) {
+        0L
+    }
+
+    /**
      * 流式解码并分块转写。
      * @param transcribe 一段 float PCM（16k 单声道）→ 歌词行（时间戳相对该段起点）
      * @param onSlice 每段转写完成的回调（歌词行、完成段数、该段起点样本数）；
@@ -99,6 +124,9 @@ object WhisperAudio {
         inputPath: String,
         pcmFile: File,
         sliceSec: Int,
+        /** 只转写前 N 秒（0=不限）。长音频（有声书/歌单）整集转写要跑几十分钟，
+         *  手机端不可接受，UI 上也会长时间停在低百分比。 */
+        maxSeconds: Int = 0,
         transcribe: (FloatArray) -> List<com.galigalimusic.data.remote.BilibiliApi.LrcLine>,
         onSlice: (List<com.galigalimusic.data.remote.BilibiliApi.LrcLine>, Int, Long) -> Unit,
         isCancelled: () -> Boolean,
@@ -225,10 +253,15 @@ object WhisperAudio {
         val info = MediaCodec.BufferInfo()
         var inputDone = false
         var outputDone = false
+        val maxFrames = if (maxSeconds > 0) maxSeconds.toLong() * OUT_RATE else Long.MAX_VALUE
+        // 见 TRY_AGAIN_LATER 分支：残缺输入上部分解码器不回 EOS，用空闲计数兜底
+        var idleRounds = 0
 
         try {
             while (!outputDone) {
                 if (isCancelled()) break
+                // 到达识别上限：主动停，别再往后续段白跑
+                if (pcmFrames >= maxFrames) break
                 if (!inputDone) {
                     val inIdx = codec.dequeueInputBuffer(10_000)
                     if (inIdx >= 0) {
@@ -248,10 +281,22 @@ object WhisperAudio {
                         val of = codec.outputFormat
                         outSampleRate = of.getInteger(KEY_SAMPLE_RATE)
                         outChannels = of.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
-                        pcmEncoding = of.getInteger(KEY_PCM_ENCODING, android.media.AudioFormat.ENCODING_PCM_16BIT)
+                        // 注意：getInteger(String, int) 双参重载要 API 29，minSdk 24 不能用；
+                        // 改用 containsKey + 单参 getInteger（API 16+）兼容旧系统
+                        pcmEncoding = if (of.containsKey(KEY_PCM_ENCODING)) of.getInteger(KEY_PCM_ENCODING)
+                        else android.media.AudioFormat.ENCODING_PCM_16BIT
                     }
-                    MediaCodec.INFO_TRY_AGAIN_LATER -> Unit
+                    MediaCodec.INFO_TRY_AGAIN_LATER -> {
+                        // 华为 CCodec 实测：容器头声明 57 分钟、实际只有前几十秒数据的
+                        // 残缺文件，解到数据末尾后永远不回 EOS，这里会死等下去（CPU≈0）。
+                        // 输入已结束且连续 6 轮（≈60s）毫无输出，判定数据耗尽，收尾出词。
+                        if (inputDone && ++idleRounds >= 6) {
+                            Log.w(TAG, "decoder idle after EOS, assume truncated input; stop decoding")
+                            outputDone = true
+                        }
+                    }
                     in 0 until Int.MAX_VALUE -> {
+                        idleRounds = 0
                         val outBuf = codec.getOutputBuffer(outIdx)!!
                         if (info.size > 0 && info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG == 0) {
                             val frames = info.size / (2 * outChannels)

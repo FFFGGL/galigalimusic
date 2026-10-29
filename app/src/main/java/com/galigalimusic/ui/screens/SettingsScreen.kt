@@ -216,43 +216,22 @@ fun SettingsScreen(db: com.galigalimusic.data.local.AppDatabase) {
                 )
                 if (amoledSchedOn) {
                     // 起止小时调整（跨零点，如 22→6 表示夜间时段）
-                    Row(
+                    // 窄屏（<380dp）单行放不下，故固定为两行堆叠，任何宽度不溢出
+                    Column(
                         modifier = Modifier
                             .fillMaxWidth()
                             .padding(horizontal = 16.dp, vertical = 4.dp),
-                        verticalAlignment = Alignment.CenterVertically,
                     ) {
-                        Text("开始", style = MaterialTheme.typography.bodyMedium,
-                            modifier = Modifier.width(40.dp))
-                        TextButton(onClick = {
-                            ThemeEngine.setAmoledSchedule(true, (amoledSchedStart + 23) % 24, amoledSchedEnd)
-                        }) { Text("−") }
-                        Text(
-                            "%02d:00".format(amoledSchedStart),
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = MaterialTheme.colorScheme.primary,
-                            modifier = Modifier.width(56.dp),
-                            textAlign = TextAlign.Center,
+                        ScheduleHourRow(
+                            label = "开始",
+                            hour = amoledSchedStart,
+                            onHour = { ThemeEngine.setAmoledSchedule(true, it, amoledSchedEnd) },
                         )
-                        TextButton(onClick = {
-                            ThemeEngine.setAmoledSchedule(true, (amoledSchedStart + 1) % 24, amoledSchedEnd)
-                        }) { Text("+") }
-                        Spacer(Modifier.width(16.dp))
-                        Text("结束", style = MaterialTheme.typography.bodyMedium,
-                            modifier = Modifier.width(40.dp))
-                        TextButton(onClick = {
-                            ThemeEngine.setAmoledSchedule(true, amoledSchedStart, (amoledSchedEnd + 23) % 24)
-                        }) { Text("−") }
-                        Text(
-                            "%02d:00".format(amoledSchedEnd),
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = MaterialTheme.colorScheme.primary,
-                            modifier = Modifier.width(56.dp),
-                            textAlign = TextAlign.Center,
+                        ScheduleHourRow(
+                            label = "结束",
+                            hour = amoledSchedEnd,
+                            onHour = { ThemeEngine.setAmoledSchedule(true, amoledSchedStart, it) },
                         )
-                        TextButton(onClick = {
-                            ThemeEngine.setAmoledSchedule(true, amoledSchedStart, (amoledSchedEnd + 1) % 24)
-                        }) { Text("+") }
                     }
                 }
             }
@@ -746,6 +725,29 @@ private fun SettingSwitch(
         }
         Spacer(Modifier.width(8.dp))
         Switch(checked = checked, onCheckedChange = onChecked, enabled = enabled)
+    }
+}
+
+/** AMOLED 定时的一行小时调节：标签 + [−] HH:00 [+] */
+@Composable
+private fun ScheduleHourRow(label: String, hour: Int, onHour: (Int) -> Unit) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 2.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(label, style = MaterialTheme.typography.bodyMedium,
+            modifier = Modifier.width(40.dp))
+        TextButton(onClick = { onHour((hour + 23) % 24) }) { Text("−") }
+        Text(
+            "%02d:00".format(hour),
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.primary,
+            modifier = Modifier.width(56.dp),
+            textAlign = TextAlign.Center,
+        )
+        TextButton(onClick = { onHour((hour + 1) % 24) }) { Text("+") }
     }
 }
 

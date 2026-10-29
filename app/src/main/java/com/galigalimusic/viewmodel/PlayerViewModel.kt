@@ -47,6 +47,8 @@ class PlayerViewModel(
     data class Playback(
         val positionMs: Long = 0L,
         val durationMs: Long = 0L,
+        /** 已缓冲到的位置：配合缓存字节数反推码率，判断缓存够不够识别用 */
+        val bufferedMs: Long = 0L,
         val isPlaying: Boolean = false,
     )
 
@@ -124,6 +126,11 @@ class PlayerViewModel(
     // ===== 倍速播放 =====
     companion object {
         val SPEEDS = listOf(0.75f, 1.0f, 1.25f, 1.5f, 2.0f)
+
+        /** 本地识别只做前 N 秒：whisper base 在手机上约 3~5 倍实时，
+         *  整集（有声书常见 40~60 分钟）要跑几十分钟，用户等不到。
+         *  20 分钟 ≈ 40 段 ≈ 5~7 分钟出全词，是体验与覆盖的折中。 */
+        const val RECOGNIZE_MAX_SEC = 1200
     }
 
     private val _speed = MutableStateFlow(prefs.getFloat("playback_speed", 1.0f))
@@ -309,6 +316,7 @@ class PlayerViewModel(
                         _playback.value = Playback(
                             positionMs = player.currentPosition.coerceAtLeast(0),
                             durationMs = player.duration.coerceAtLeast(0),
+                            bufferedMs = player.bufferedPosition.coerceAtLeast(0),
                             isPlaying = player.isPlaying,
                         )
                         _isPlaying.value = player.isPlaying
@@ -483,12 +491,21 @@ class PlayerViewModel(
                 val cachedBytes = runCatching {
                     cache.getCachedBytes(cacheKey, 0, Long.MAX_VALUE)
                 }.getOrDefault(0L)
-                BiliSession.appendDebug("recognize: cache bytes=$cachedBytes for $cacheKey")
+                // 关键：getCachedBytes 是稀疏 span 的总和，拖过进度条后中间有空档也会"看着很大"。
+                // 只有「从 0 开始连续」的字节才是能拼出完整容器的，否则一律重下（否则解码出静音）。
+                val contiguousBytes = runCatching {
+                    com.galigalimusic.player.MediaCache.contiguousBytesFromZero(cache, cacheKey)
+                }.getOrDefault(0L)
+                val sparse = contiguousBytes < cachedBytes
+                BiliSession.appendDebug(
+                    "recognize: cache bytes=$cachedBytes contiguous=$contiguousBytes sparse=$sparse for $cacheKey"
+                )
                 audioFile = java.io.File(appContext.cacheDir, "whisper_audio.m4a")
+                // 先清掉上次失败残留，避免重下分支读到旧坏文件
+                runCatching { audioFile.delete() }
                 var exportedOk = false
-                if (cachedBytes > 512 * 1024) {
+                if (contiguousBytes > 512 * 1024 && !sparse) {
                     BiliSession.appendDebug("recognize: export from cache")
-                    audioFile.delete()
                     val exported = com.galigalimusic.player.MediaCache.exportToFile(cache, cacheKey, audioFile)
                     BiliSession.appendDebug("recognize: exported $exported bytes")
                     // 关键校验：SimpleCache 拼出来的字节可能缺 MP4 容器头（m4s 分片），
@@ -496,7 +513,34 @@ class PlayerViewModel(
                     // whisper 只会返回空 segments（实测踩过）。校验不过就走重下。
                     exportedOk = exported > 0 &&
                         com.galigalimusic.whisper.WhisperAudio.hasParsableAudioTrack(audioFile.absolutePath)
+                    // 再校验数据量：容器头里的时长是「声明值」，缓存残缺时它照样报完整时长
+                    // （实测 2MB 残文件也报 57:24），所以拿它比时长判断不出完整性。
+                    // 改为：用「连续字节 ÷ 已缓冲秒数」反推码率，乘以识别需要的秒数，
+                    // 看从 0 连续缓存够不够。拖过进度条的缓存往往只有开头几十秒，
+                    // 这种文件解到数据末尾会在部分机型上挂死（华为 CCodec 不回 EOS）。
+                    if (exportedOk) {
+                        val trackDur = _playback.value.durationMs
+                        val bufferedMs = _playback.value.bufferedMs
+                        val needSec = (if (trackDur > 0L) {
+                            minOf(trackDur / 1000L, RECOGNIZE_MAX_SEC.toLong())
+                        } else {
+                            RECOGNIZE_MAX_SEC.toLong()
+                        }).coerceAtLeast(1L)
+                        val needBytes = if (bufferedMs > 1_000L) {
+                            contiguousBytes.toDouble() * needSec * 1_000.0 / bufferedMs
+                        } else {
+                            0.0
+                        }
+                        val enough = needBytes > 0.0 && contiguousBytes >= needBytes * 0.95
+                        BiliSession.appendDebug(
+                            "recognize: cache export trackDur=$trackDur buffered=$bufferedMs " +
+                            "needSec=$needSec needBytes=${needBytes.toLong()} enough=$enough"
+                        )
+                        if (!enough) exportedOk = false
+                    }
                     BiliSession.appendDebug("recognize: cache export parsable=$exportedOk")
+                } else if (sparse) {
+                    BiliSession.appendDebug("recognize: cache sparse (seeked), skip export → redownload")
                 }
                 if (!exportedOk) {
                     // 缓存不可用或不是完整容器：重新解析并下载完整响应体
@@ -524,10 +568,15 @@ class PlayerViewModel(
                 if (ptr == 0L) throw IllegalStateException("模型加载失败，请重装模型后再试")
                 try {
                     val acc = mutableListOf<com.galigalimusic.data.remote.BilibiliApi.LrcLine>()
+                    // 进度百分比的分母：本次实际要转写的秒数（长音频按上限截断）
+                    val trackSec = _playback.value.durationMs / 1000L
+                    val targetSec = (if (trackSec > 0L) minOf(trackSec, RECOGNIZE_MAX_SEC.toLong())
+                    else RECOGNIZE_MAX_SEC.toLong()).coerceAtLeast(1L)
                     com.galigalimusic.whisper.WhisperAudio.decodeTranscribeStreaming(
                         audioFile!!.absolutePath,
                         wavFile!!,
                         sliceSec = 30,
+                        maxSeconds = RECOGNIZE_MAX_SEC,
                         transcribe = { samples ->
                             // 首段真正进入推理时把状态切到「识别中」
                             if (_recognizeState.value != RecognizeState.TRANSCRIBING) {
@@ -541,12 +590,17 @@ class PlayerViewModel(
                             com.galigalimusic.whisper.WhisperLocal.parseNativeJson(json)
                         },
                         // lines 时间戳已由 WhisperAudio 换算成整集绝对毫秒，这里直接追加
-                        onSlice = { lines, idx, _ ->
+                        onSlice = { lines, idx, fromSample ->
                             acc += lines
                             _lyrics.value = acc.toList()
                             _lyricsState.value = LyricsState.LOADED
                             _lyricsSource.value = WhisperLocal.LyricSource.WHISPER
-                            _recognizeProgress.value = idx
+                            // 进度按「已转写秒数 ÷ 目标秒数」算：以前直接拿段序号当百分比，
+                            // 57 分钟的音频 100 多段，进度条基本不动，看着像卡死
+                            val doneSec = (fromSample / com.galigalimusic.whisper.WhisperAudio.OUT_RATE +
+                                30L).coerceAtMost(targetSec)
+                            _recognizeProgress.value =
+                                (doneSec * 100 / targetSec).toInt().coerceIn(1, 99)
                             // 增量落盘：每 3 段存一次，取消也不丢已识别内容
                             if (idx % 3 == 0) {
                                 com.galigalimusic.whisper.WhisperLocal.saveLyricCache(
@@ -569,7 +623,17 @@ class PlayerViewModel(
                         _recognizeMsg.value = if (recognizeCancel) {
                             "已取消，保留已识别的 ${acc.size} 句"
                         } else {
-                            "识别完成，共 ${acc.size} 句"
+                            val capped = trackSec > RECOGNIZE_MAX_SEC
+                            val tail = if (capped) "（仅前 ${RECOGNIZE_MAX_SEC / 60} 分钟）" else ""
+                            "识别完成，共 ${acc.size} 句$tail"
+                        }
+                        // 提示挂 10 秒自动收起，别长期占着歌词区底部
+                        viewModelScope.launch {
+                            kotlinx.coroutines.delay(10_000)
+                            if (_recognizeState.value == RecognizeState.DONE) {
+                                _recognizeState.value = RecognizeState.IDLE
+                                _recognizeMsg.value = ""
+                            }
                         }
                     } else if (recognizeCancel) {
                         _recognizeState.value = RecognizeState.IDLE
@@ -608,6 +672,11 @@ class PlayerViewModel(
             m.contains("HTTP 4") || m.contains("HTTP 5") -> "下载失败（$m），请稍后重试"
             m.contains("不完整") -> "模型文件下载不完整，请重试"
             m.contains("没有音频轨") -> "该音频没有可解码的音轨"
+            // 拖过进度条后老版本会拼出「半真半假」的缓存文件，解码出静音落到这里。
+            // 现在已改为自动重下完整音频，正常不会再触发，保留为兜底并给可执行建议。
+            // 注意别用宽泛的「不完整」，否则会抢走下面「模型文件下载不完整」那条。
+            m.contains("解码为空") || m.contains("缺少容器头") ->
+                "音频数据不完整，已自动重下，请再点一次识别"
             m.contains("模型加载失败") -> "识别模型加载失败，请重试或清理后重下"
             else -> m.take(80).ifEmpty { "识别失败，请重试" }
         }

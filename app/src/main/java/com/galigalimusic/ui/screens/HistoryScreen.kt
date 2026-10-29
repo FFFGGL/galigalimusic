@@ -47,6 +47,8 @@ fun HistoryScreen(
     // 多选删除：长按条目进入选择模式
     var selectionMode by remember { mutableStateOf(false) }
     var selected by remember { mutableStateOf(setOf<String>()) }
+    // 清空二次确认（防止误触整库删除）
+    var showClearConfirm by remember { mutableStateOf(false) }
     fun keyOf(item: HistoryEntity) = "${item.bvid}|${item.cid}"
 
     Column(modifier = Modifier.fillMaxSize().padding(horizontal = 16.dp)) {
@@ -72,7 +74,10 @@ fun HistoryScreen(
                 TextButton(onClick = { selectionMode = false; selected = emptySet() }) { Text("完成") }
             } else {
                 TextButton(onClick = onOpenDownloads) { Text("下载") }
-                TextButton(onClick = { vm.clear() }, enabled = history.isNotEmpty()) { Text("清空") }
+                TextButton(
+                    onClick = { showClearConfirm = true },
+                    enabled = history.isNotEmpty(),
+                ) { Text("清空") }
             }
         }
         Spacer(Modifier.height(12.dp))
@@ -91,6 +96,8 @@ fun HistoryScreen(
                 items(history) { item ->
                     val key = keyOf(item)
                     val isSelected = key in selected
+                    // 当前播放曲（收集而非 .value，切歌时徽标实时刷新）
+                    val playingTrack = playerVm?.current?.collectAsState()
                     // 最近优先；点击续播（重新解析播放地址），长按多选删除
                     Surface(
                         color = if (isSelected) MaterialTheme.colorScheme.primaryContainer
@@ -166,8 +173,8 @@ fun HistoryScreen(
                                     )
                                 }
                             }
-                            if (item.bvid == playerVm?.current?.value?.bvid &&
-                                item.cid == playerVm?.current?.value?.cid
+                            if (item.bvid == playingTrack?.value?.bvid &&
+                                item.cid == playingTrack?.value?.cid
                             ) {
                                 Text(
                                     "播放中",
@@ -181,6 +188,32 @@ fun HistoryScreen(
                 item { Spacer(Modifier.height(12.dp)) }
             }
         }
+    }
+
+    if (showClearConfirm) {
+        AlertDialog(
+            onDismissRequest = { showClearConfirm = false },
+            title = { Text("清空播放历史") },
+            text = {
+                Text(
+                    "将删除全部 ${history.size} 条播放记录（含收听时长与续播进度），" +
+                        "此操作不可恢复。下载记录不受影响。",
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        vm.clear()
+                        showClearConfirm = false
+                    },
+                ) {
+                    Text("全部删除", color = MaterialTheme.colorScheme.error)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showClearConfirm = false }) { Text("取消") }
+            },
+        )
     }
 }
 

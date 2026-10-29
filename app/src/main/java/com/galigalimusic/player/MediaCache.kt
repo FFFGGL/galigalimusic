@@ -41,14 +41,37 @@ object MediaCache {
         return total
     }
 
+    /**
+     * 从字节 0 开始「首尾相接」的连续缓存字节数。
+     *
+     * SimpleCache 允许稀疏 span：用户拖动进度条后，缓存里会留下大片空档
+     * （例如 0–2MB 播过、2–50MB 空档、50MB 之后又播过）。
+     * 此时 [Cache.getCachedBytes] 返回的是所有 span 的**总和**，看着很完整，
+     * 但按 span 顺序直接拼接会丢掉空档处的字节、MP4 容器偏移全错，
+     * 解码出来是静音/垃圾 → 本地识别报「音频解码为空」。
+     * 本方法只累计从 0 开始连续的前缀，遇到空档立即停止，供调用方判断缓存是否可用。
+     */
+    fun contiguousBytesFromZero(c: SimpleCache, key: String): Long {
+        var expected = 0L
+        for (span in c.getCachedSpans(key).sortedBy { it.position }) {
+            if (span.position > expected) break      // 出现空档，后续字节无法拼接
+            val end = span.position + span.length
+            if (end > expected) expected = end
+        }
+        return expected
+    }
+
     /** 将缓存中某个 key 的完整字节按 span 顺序导出为文件（供本地识别）。 */
     fun exportToFile(c: SimpleCache, key: String, dest: File): Long {
         val spans = c.getCachedSpans(key).sortedBy { it.position }
         if (spans.isEmpty()) return 0L
         var total = 0L
+        var expected = 0L
         dest.outputStream().use { out ->
             for (span in spans) {
-                val file = span.file ?: continue
+                // 只拼接连续前缀：span 之间有空洞就停，避免产出「半真半假」的坏文件
+                if (span.position != expected) break
+                val file = span.file ?: break
                 file.inputStream().use { input ->
                     val buf = ByteArray(256 * 1024)
                     var remaining = span.length
@@ -60,6 +83,7 @@ object MediaCache {
                         remaining -= n
                     }
                 }
+                expected += span.length
             }
         }
         return total

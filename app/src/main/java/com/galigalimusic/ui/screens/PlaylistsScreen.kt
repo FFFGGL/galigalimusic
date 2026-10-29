@@ -271,7 +271,8 @@ fun PlaylistsScreen(
         )
     }
 
-    Column(modifier = Modifier.fillMaxSize().padding(horizontal = 16.dp)) {        Spacer(Modifier.height(16.dp))
+    Column(modifier = Modifier.fillMaxSize().padding(horizontal = 16.dp)) {
+        Spacer(Modifier.height(16.dp))
         Row(verticalAlignment = Alignment.CenterVertically) {
             Text("歌单", style = MaterialTheme.typography.headlineSmall)
             Spacer(Modifier.weight(1f))

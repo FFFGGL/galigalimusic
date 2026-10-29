@@ -21,6 +21,7 @@ import androidx.compose.material.icons.automirrored.rounded.ArrowBack
 import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.Pause
 import androidx.compose.material.icons.rounded.PlayArrow
+import androidx.compose.material.icons.rounded.PlaylistPlay
 import androidx.compose.material.icons.rounded.Repeat
 import androidx.compose.material.icons.rounded.RepeatOne
 import androidx.compose.material.icons.rounded.Search
@@ -82,6 +83,9 @@ fun LyricsScreen(
     val lyricOffset by playerVm.lyricOffsetMs.collectAsState()
     val fontScale by playerVm.lyricFontScale.collectAsState()
     val lyricsSource by playerVm.lyricsSource.collectAsState()
+    // 识别态/进度提升到页面级收集：when 条件与进度条都需要观察变化
+    val recognizeState by playerVm.recognizeState.collectAsState()
+    val recognizeProgress by playerVm.recognizeProgress.collectAsState()
 
     val cs = MaterialTheme.colorScheme
     val cur = current
@@ -90,6 +94,9 @@ fun LyricsScreen(
     var twoLineMode by remember { mutableStateOf(true) }
     var searching by remember { mutableStateOf(false) }
     var query by remember { mutableStateOf("") }
+    // 分P 选集面板（听书/多P 场景：看歌词时直接切集）
+    var showPages by remember { mutableStateOf(false) }
+    val pages by playerVm.pages.collectAsState()
     // B5：正在校正的行下标（null = 关对话框）
     var editingIndex by remember { mutableStateOf<Int?>(null) }
     val searchResults: List<BilibiliApi.LrcLine> =
@@ -173,6 +180,16 @@ fun LyricsScreen(
                             else cs.onSurface,
                         )
                     }
+                    // 分P 选集：仅多 P 内容显示（单P/本地/AList 无意义）
+                    if (pages.size > 1) {
+                        IconButton(onClick = { showPages = true }) {
+                            Icon(
+                                Icons.Rounded.PlaylistPlay,
+                                contentDescription = "分P选集",
+                                tint = cs.onSurface,
+                            )
+                        }
+                    }
                     Spacer(Modifier.width(48.dp))
                 }
             }
@@ -244,7 +261,7 @@ fun LyricsScreen(
                             )
                         }
                     }
-                playerVm.recognizeState.value == PlayerViewModel.RecognizeState.TRANSCRIBING ->
+                recognizeState == PlayerViewModel.RecognizeState.TRANSCRIBING ->
                     Box(Modifier.weight(1f).fillMaxWidth()) {
                         // 识别中歌词已逐段上屏：正常渲染，底部叠进度条
                         if (twoLineMode) {
@@ -272,12 +289,12 @@ fun LyricsScreen(
                         }
                         Column(Modifier.align(Alignment.BottomCenter).padding(bottom = 8.dp)) {
                             LinearProgressIndicator(
-                                progress = { playerVm.recognizeProgress.value / 100f },
+                                progress = { recognizeProgress / 100f },
                                 modifier = Modifier.fillMaxWidth(),
                                 color = cs.primary,
                             )
                             Text(
-                                "🎤 分块识别中 ${playerVm.recognizeProgress.value}% · 歌词已逐段上屏",
+                                "🎤 分块识别中 ${recognizeProgress}% · 歌词已逐段上屏",
                                 style = MaterialTheme.typography.labelSmall,
                                 color = cs.onSurfaceVariant,
                                 modifier = Modifier.padding(top = 4.dp),
@@ -460,6 +477,18 @@ fun LyricsScreen(
                     playerVm.saveLyricEdit(index, text, startMs, endMs)
                     editingIndex = null
                 },
+            )
+        }
+        // 分P 选集面板：切集后本页数据（标题/歌词/进度）随 playerVm 状态自动刷新
+        if (showPages) {
+            PagesSheet(
+                pages = pages,
+                currentCid = current?.cid ?: 0L,
+                onPick = {
+                    playerVm.playPage(it)
+                    showPages = false
+                },
+                onDismiss = { showPages = false },
             )
         }
     }

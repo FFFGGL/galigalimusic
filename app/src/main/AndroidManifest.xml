@@ -8,6 +8,8 @@
     <uses-permission android:name="android.permission.READ_MEDIA_AUDIO" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+    <!-- DownloadService 声明了 foregroundServiceType="dataSync"，targetSdk 34+ 必须配套声明，否则启动服务抛 SecurityException -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <!-- allowBackup 关闭：Cookie/SESSDATA 等登录凭据不应随系统云备份外流 -->
